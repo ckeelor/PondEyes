@@ -214,6 +214,11 @@ Playback Features:
 
 ---
 
+PondEyes has been analyzed by DeepWiki and the documentation is available for further reference:
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/davidkarnowski/PondEyes)
+
+---
+
 Copyright © 2025 David D. Karnowski.
 
 ---
