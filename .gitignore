@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# PondEyes runtime
+radar_config.json
+log/
+logs/
+
+# SVG maps — keep the default, ignore generated/local maps
+*.svg
+!map.svg

@@ -97,7 +97,12 @@ class RadarGUI:
         self.fields = ["Broker IP", "Port", "Topic",
                        "Serial Port", "Trail Duration", "Trail ON"]
         self.cfg_input = [str(cfg["broker"]), str(cfg["port"]), cfg["topic"],
-                          self.serial_port, str(self.trail_duration), str(self.trail_on)]
+                          self.serial_port, str(self.trail_duration), str(self.trail_on),
+                          str(cfg["map"])]
+        self.MAP_FIELD = 6
+        self.cfg_error = ""
+        self.banner_msg = ""
+        self.banner_until = 0.0
         self.visible_idx: List[int] = []
         self.cur_vis = self.cur_field = 0
         self._update_visible()
@@ -144,7 +149,11 @@ class RadarGUI:
         if self.input_mode == "mqtt":
             self.reader = RadarMQTT(self.cfg["broker"], self.cfg["port"],
                                     self.cfg["topic"], self._on_frame)
-            self.reader.connect()
+            try:
+                self.reader.connect()
+            except OSError as exc:
+                # broker unreachable — leave reader idle so GUI shows DATA STREAM LOST
+                self.cfg_error = f"MQTT connect failed: {exc}"
         else:
             self.reader = RadarSerial(self.serial_port, self.serial_baud,
                                       self._on_frame)
@@ -266,7 +275,7 @@ class RadarGUI:
 
     # ───────────────────────────────────────── CONFIG pop-up
     def _draw_cfg_popup(self):
-        w,h = 600,420
+        w,h = 600,520
         rect = pygame.Rect((self.screen.get_width()-w)//2,
                            (self.screen.get_height()-h)//2,w,h)
         pygame.draw.rect(self.screen,C.BLACK,rect); pygame.draw.rect(self.screen,C.GREEN,rect,2)
@@ -289,6 +298,22 @@ class RadarGUI:
             txt = f"{self.fields[f]}: {self.cfg_input[f]}" + (" ▌" if f==self.cur_field else "")
             surf = C.MID_FONT.render(txt,True,C.GREEN if f==self.cur_field else C.DIM)
             self.screen.blit(surf,(rect.x+20,start_y+vis_i*45))
+
+        # ── Map row (separated from input fields) ──
+        map_y = rect.y + 285
+        pygame.draw.line(self.screen, C.DIM,
+                         (rect.x+20, map_y-8), (rect.right-20, map_y-8), 1)
+        from os.path import basename
+        path = self.cfg_input[self.MAP_FIELD]
+        disp = basename(path) if path else "(none)"
+        if len(disp) > 38: disp = "…" + disp[-37:]
+        self.screen.blit(C.MID_FONT.render(f"Map: {disp}", True, C.GREEN),
+                         (rect.x+20, map_y))
+        browse = pygame.Rect(rect.right-130, map_y-4, 110, 28)
+        pygame.draw.rect(self.screen, C.GREEN, browse, 2)
+        self.screen.blit(C.SMALL_FONT.render("BROWSE…", True, C.GREEN),
+                         C.SMALL_FONT.render("BROWSE…", True, C.GREEN).get_rect(center=browse.center))
+        self.cfg_buttons.update({"browse_map": browse})
 
         # smoothing slider
         slide = pygame.Rect(rect.x+150,rect.bottom-160,300,12)
@@ -315,6 +340,10 @@ class RadarGUI:
             self.screen.blit(C.FONT.render(lbl,True,C.GREEN),
                              C.FONT.render(lbl,True,C.GREEN).get_rect(center=b.center))
         self.cfg_buttons.update({"save":save,"cancel":cancel,"set_sensor":ss})
+
+        if self.cfg_error:
+            err = C.SMALL_FONT.render(self.cfg_error, True, C.RED)
+            self.screen.blit(err, (rect.x+20, rect.bottom-130))
 
     # ───────────────────────────────────────── wizard intro overlay
     def _draw_sensor_intro(self):
@@ -344,6 +373,7 @@ class RadarGUI:
 
     # ───────────────────────────────────────── save CONFIG
     def _cfg_save(self):
+        self.cfg_error = ""
         self.cfg.update(
             input_mode=self.input_mode,
             broker=self.cfg_input[0],
@@ -358,7 +388,85 @@ class RadarGUI:
         self.trail_duration = float(self.cfg["trail_duration"])
         self.trail_on       = bool(self.cfg["trail_on"])
         self._open_input()
+
+        old_map = self.cfg.get("map")
+        new_map = self.cfg_input[self.MAP_FIELD].strip()
+        if not new_map:
+            self.cfg_input[self.MAP_FIELD] = old_map or ""
+        elif new_map != old_map:
+            self.cfg["map"] = new_map
+            try:
+                self.refresh_map()
+                self._check_sensor_bounds()
+            except Exception as exc:
+                self.cfg["map"] = old_map
+                self.cfg_input[self.MAP_FIELD] = old_map or ""
+                self.cfg_error = f"Map load failed: {exc}"
+                try:
+                    self.refresh_map()
+                except Exception:
+                    pass
+                self._sync_cfg()
+                return
+
         self._sync_cfg()
+
+    # ───────────────────────────────────────── native file picker
+    def _pick_map_file(self):
+        """
+        macOS: AppleScript via `osascript` (Tk in-process crashes against
+        pygame's SDLApplication).  Linux: subprocess-isolated tkinter.
+        """
+        import sys, subprocess
+        initial = str(C.ROOT)
+        try:
+            if sys.platform == "darwin":
+                script = (
+                    'set f to choose file with prompt "Select map SVG" '
+                    f'default location (POSIX file "{initial}")\n'
+                    'return POSIX path of f'
+                )
+                r = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    if "User canceled" in r.stderr or "-128" in r.stderr:
+                        return
+                    self.cfg_error = f"Browse failed: {r.stderr.strip() or 'osascript error'}"
+                    return
+                path = r.stdout.strip()
+            else:
+                code = (
+                    "import tkinter as tk\n"
+                    "from tkinter import filedialog\n"
+                    "r = tk.Tk(); r.withdraw()\n"
+                    f"p = filedialog.askopenfilename(initialdir={initial!r}, "
+                    "filetypes=[('SVG','*.svg'),('All','*.*')])\n"
+                    "print(p)\n"
+                )
+                r = subprocess.run([sys.executable, "-c", code],
+                                   capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    self.cfg_error = f"Browse failed: {r.stderr.strip() or 'tkinter error'}"
+                    return
+                path = r.stdout.strip()
+        except Exception as exc:
+            self.cfg_error = f"Browse failed: {exc}"
+            return
+        if path:
+            self.cfg_input[self.MAP_FIELD] = path
+            self.cfg_error = ""
+
+    # ───────────────────────────────────────── sensor bounds check
+    def _check_sensor_bounds(self):
+        from radar.svg_utils import _svg_mm
+        try:
+            w_mm, h_mm = _svg_mm(self.cfg["map"])
+        except Exception:
+            return
+        sx, sy = self.sensor_mm
+        if not (0 <= sx <= w_mm and 0 <= sy <= h_mm):
+            self.banner_msg = "SENSOR OFF-MAP — re-run SET SENSOR"
+            self.banner_until = time.monotonic() + 5.0
 
     # ───────────────────────────────────────── avg motion helper
     def _avg_motion(self,ser,x,y,v):
@@ -388,6 +496,11 @@ class RadarGUI:
                 elif e.type==pygame.VIDEORESIZE and not self.full_screen:
                     self.screen=pygame.display.set_mode(e.size,pygame.RESIZABLE)
                     self.refresh_map()
+
+                elif e.type==pygame.DROPFILE:
+                    if self.show_cfg and e.file.lower().endswith(".svg"):
+                        self.cfg_input[self.MAP_FIELD] = e.file
+                    continue
 
                 # Wizard intro buttons
                 if self.sensor_stage=="intro" and e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
@@ -419,11 +532,15 @@ class RadarGUI:
                             self.cfg_input[self.cur_field]+=e.unicode
                     elif e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
                         if self.cfg_buttons["save"].collidepoint(e.pos):
-                            self._cfg_save(); self.show_cfg=False
+                            self._cfg_save()
+                            if not self.cfg_error:
+                                self.show_cfg=False
                         elif self.cfg_buttons["cancel"].collidepoint(e.pos):
                             self.show_cfg=False
                         elif self.cfg_buttons["set_sensor"].collidepoint(e.pos):
                             self.show_cfg=False; self.sensor_stage="intro"
+                        elif "browse_map" in self.cfg_buttons and self.cfg_buttons["browse_map"].collidepoint(e.pos):
+                            self._pick_map_file()
                         elif self.level_rect.collidepoint(e.pos):
                             self.drag_level=True
                         elif self.cfg_buttons["mode_mqtt"].collidepoint(e.pos):
@@ -475,7 +592,7 @@ class RadarGUI:
                             self.map_mode=True; self.top_pad=self.bottom_pad=C.MAP_BORDER
                             self.refresh_map(); continue
                         if not self.map_mode and m["config"].collidepoint(e.pos):
-                            self.show_cfg=True; self.cur_vis=0; self.cur_field=self.visible_idx[0]; continue
+                            self.show_cfg=True; self.cur_vis=0; self.cur_field=self.visible_idx[0]; self.cfg_error=""; continue
                         if not self.map_mode and m["trail"].collidepoint(e.pos):
                             self.trail_on=not self.trail_on; self._sync_cfg(); continue
                         if not self.map_mode and m["smooth"].collidepoint(e.pos):
@@ -627,6 +744,13 @@ class RadarGUI:
                 ar=alert.get_rect(center=(self.screen.get_width()//2,
                                           self.screen.get_height()//2))
                 self.screen.blit(alert,ar)
+
+            # transient sensor-bounds banner
+            if self.banner_msg and time.monotonic() < self.banner_until:
+                msg=C.FONT.render(self.banner_msg,True,C.GREEN)
+                mr=msg.get_rect(center=(self.screen.get_width()//2,
+                                        self.screen.get_height()-40))
+                self.screen.blit(msg,mr)
 
             # overlays
             if self.show_cfg: self._draw_cfg_popup()
