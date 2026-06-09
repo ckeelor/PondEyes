@@ -1,89 +1,97 @@
+# radar.mqtt_client
+# =================
+#
+# Receives LD2450 frames over MQTT (each message payload is one 30-byte frame as a hex
+# string), parses them with the shared codec, and delivers them to a callback.
+#
+# Like serial_reader, this is now a thin transport over radar.frames + radar.reader_base:
+# all wire-format knowledge lives in frames, and the start/stop lifecycle comes from Reader.
+# The MQTT-specific job is: connect, subscribe, and hand decoded frames off a worker thread
+# (so the paho network thread is never blocked by the GUI callback).
+#
+# Back-compat note: the GUI historically called `reader.connect()` and `reader.cli.loop_stop()`
+# directly. We keep `connect()` as an alias of start() and keep the `.cli` attribute so the
+# existing GUI keeps working until it is switched to the uniform start()/stop() in Phase 1.
+
+from __future__ import annotations
+
 import time
 import uuid
 import threading
 from queue import Queue, Empty
+
 import paho.mqtt.client as mqtt
 
+from radar import frames
+from radar.reader_base import Reader, FrameCallback
 
-class RadarMQTT:
-    """
-    Connects to the broker, parses length-30 radar frames, and sends them to the
-    GUI callback using a background worker thread.
 
-    The callback receives a list of 4-tuples:
-        (slot, x_mm, y_mm, raw_hex)
+class RadarMQTT(Reader):
+    HDR = frames.HDR
+    FTR = frames.FTR
+    FLEN = frames.FLEN
 
-    • `raw_hex` is the original MQTT payload as a hex string.
-    """
-
-    HDR  = bytes.fromhex("AAFF0300")
-    FTR  = bytes.fromhex("55CC")
-    FLEN = 30
-
-    def __init__(self, host, port, topic, on_frame):
+    def __init__(self, host, port, topic, on_frame: FrameCallback):
+        super().__init__(on_frame)
         self.host, self.port, self.topic = host, port, topic
-        self.on_frame = on_frame
         self.last_pkt = time.monotonic()
 
+        # A random client id avoids the broker kicking us off when several instances connect.
+        # Pin the v1 callback API explicitly: paho 2.x warns otherwise, and our on_connect /
+        # on_message signatures follow the v1 shape.
         random_id = f"gui-{uuid.uuid4().hex[:8]}"
-        self.cli = mqtt.Client(client_id=random_id)
+        try:
+            self.cli = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=random_id)
+        except (AttributeError, TypeError):
+            self.cli = mqtt.Client(client_id=random_id)   # paho 1.x fallback
         self.cli.on_connect = self._on_connect
         self.cli.on_message = self._on_msg
 
-        self.q = Queue()
+        # Decoded frames are queued here and drained by a worker thread, so the paho callback
+        # (_on_msg, on the network thread) stays fast and never runs GUI/tracker code.
+        self.q: Queue = Queue()
+        self._stop = threading.Event()
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
 
-    def connect(self):
+    def start(self) -> None:
+        # Connect to the broker and let paho run its network loop on its own thread.
         self.cli.connect(self.host, self.port, 60)
         self.cli.loop_start()
+
+    # Back-compat alias: the current GUI calls connect(); new code should call start().
+    connect = start
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self.cli.loop_stop()
+            self.cli.disconnect()
+        except Exception:
+            pass
 
     def _on_connect(self, client, *_):
         client.subscribe(self.topic)
 
     def _on_msg(self, _cli, _userdata, msg):
+        # Decode one payload. Anything malformed is silently ignored — a noisy topic must not
+        # crash the reader.
         try:
             hex_str = msg.payload.decode().strip()
             buf = bytes.fromhex(hex_str)
-
-            if (
-                len(buf) == self.FLEN and
-                buf.startswith(self.HDR) and
-                buf.endswith(self.FTR)
-            ):
-                tracks = self._parse(buf)
-                tracks = [t + (hex_str,) for t in tracks]
+            if frames.is_complete_frame(buf):
+                tracks = [t + (hex_str,) for t in frames.parse(buf)]
                 self.q.put_nowait(tracks)
                 self.last_pkt = time.monotonic()
         except Exception:
-            pass  # ignore malformed payloads
+            pass
 
     def _worker_loop(self):
-        while True:
+        # Drain decoded frames and deliver them to the callback. The 1s timeout lets the loop
+        # notice a stop() request promptly instead of blocking forever on an idle topic.
+        while not self._stop.is_set():
             try:
                 tracks = self.q.get(timeout=1)
-                self.on_frame(tracks)
+                self._on_frame(tracks, time.monotonic())   # stamp at delivery
             except Empty:
                 continue
-
-    @staticmethod
-    def _s15(u: int) -> int:
-        """16-bit signed little-endian → Python int."""
-        return u & 0x7FFF if u & 0x8000 else -(u & 0x7FFF)
-
-    def _parse(self, b: bytes):
-        """
-        Extract up to 3 target blobs from the 30-byte frame.
-
-        Returns
-        -------
-        list[(slot, x_mm, y_mm)]
-        """
-        out = []
-        for i in range(3):
-            chunk = b[4 + i * 8 : 8 + i * 8]
-            if any(chunk):
-                x = self._s15(int.from_bytes(chunk[:2], "little"))
-                y = self._s15(int.from_bytes(chunk[2:], "little"))
-                out.append((i + 1, x, y))
-        return out

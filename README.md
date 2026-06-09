@@ -1,6 +1,6 @@
 # PondEyes
 
-**PondEyes** is a Python-based visualization tool for real-time tracking of human position and motion using low-cost millimeter-wave radar modules such as the **Hi-Link HLK-LD2450**. It runs on macOS and Linux, using **PyGame** to render a top-down map view of a physical space (e.g., a room or hallway) and displays moving targets based on radar data. The system supports both **Serial (UART)** and **MQTT** input, logs all targets to CSV, and includes a full playback GUI for reviewing recorded sessions.
+**PondEyes** is a Python-based visualization tool for real-time tracking of human position and motion using low-cost millimeter-wave radar modules such as the **Hi-Link HLK-LD2450**. It runs on macOS and Linux, using **PyGame** to render a top-down map view of a physical space (e.g., a room or hallway) and displays moving targets based on radar data. The system supports **Serial (UART)** and **MQTT** input, logs all targets to an embedded **SQLite** database, and includes a full playback GUI that replays each recorded session exactly as it was captured.
 
 ---
 
@@ -13,13 +13,32 @@ It is designed around modular components, each in the `radar/` directory, with a
 
 ## Features
 
-- Tracks up to three live targets (hardware-limited)
+- **Multiple sensors on one shared map** — each with its own pose, input stream, and color
+- Per-sensor color (marker, field-of-view cone, and that sensor's targets), with an in-GUI color picker
+- **Per-sensor distance gates** (min/max range): hide targets too near/far on the map and
+  silence their beep, while the backend still tracks and logs them. Visualized as arcs + a faint
+  filled wedge; set them in the Set-Sensor wizard or by **dragging the arcs directly on the map**
+- In-GUI sensor management: add / remove / duplicate, click-to-rename, double-click a marker to edit it
+- **Map-style navigation** — click-drag or two-finger-scroll to pan, scroll/`+`/`-` to zoom (a pure
+  viewport zoom that never alters the geometry), with a zoom slider + `1:1` reset
+- **Per-target right-click menu** — **Silence** (mute it from the beep) and **Ghost** (mark a false
+  reading: greyed/translucent + silent)
+- **Per-sensor data-loss indicator** — a sensor that goes quiet flashes "NO DATA" even while others stream
+- Per-sensor trail toggle, with a main-window **master TRAIL override**
+- **Per-sensor speed sensitivity** — splits a track when a target "teleports" (the module reused a
+  target slot for a different person), while still allowing genuinely fast movement (runners)
+- **Editable serial baud** per sensor, with an **AUTO-baud** probe that locks onto the right rate
+- Tracks up to three live targets *per sensor* (hardware-limited)
 - Custom SVG space maps for accurate placement
-- Serial (UART) and MQTT input modes
+- Serial (UART), MQTT, and **simulated** input modes (the `sim` mode needs no hardware)
 - Adjustable motion smoothing and trail duration
-- Distance-based audible alerts and color-coded velocity display
-- Target logging with CSV output for analysis and playback
-- Full playback window for reviewing tracked movement
+- Distance-based audible alerts; per-sensor hue, with speed shown by the pulse ring
+- Target logging to an embedded **SQLite** database (`pondeyes.db`), with full sensor attribution
+  and accurate per-frame timing (timestamped at the reader, not after processing)
+- **Faithful playback**: each track is replayed through its *recorded* sensor snapshot — pose,
+  color, distance gates, and trail — at the true recorded cadence, so playback looks like the live
+  view. The live view and playback share one renderer.
+- Verbose runtime logging (`run-logs/pondeyes.log`; `PONDEYES_LOG=DEBUG` for detail)
 
 ---
 PondEyes Development Demonstration (YouTube):
@@ -31,19 +50,31 @@ PondEyes Development Demonstration (YouTube):
 
 ```
 PondEyes/
-├── main.py
+├── main.py                  # Launcher: load config -> RadarGUI -> run
 ├── radar/
-│   ├── config.py           # Loads and saves radar_config.json with defaults
-│   ├── constants.py        # Global constants, colors, and font setup
-│   ├── gui.py              # Live visualization GUI (PyGame main window)
-│   ├── mqtt_client.py      # MQTT frame receiver and parser
-│   ├── playback_gui.py     # CSV track playback GUI
-│   ├── serial_reader.py    # Serial interface reader for LD2450/HLK-LD2450
-│   ├── sound.py            # Distance and velocity-based audio tones
-│   ├── svg_utils.py        # SVG rasterization and coordinate fitting
-│   ├── tracking.py         # Target bookkeeping and per-track CSV writing
-│   └── config.json         # Generated runtime configuration file
-└── logs/                   # Automatically created per-day CSV logs
+│   ├── config.py            # Loads/saves radar_config.json (schema v2) with migration
+│   ├── constants.py         # Global constants, colors, font setup
+│   ├── sensors.py           # Sensor dataclass (pose, color, transport, gates, ...)
+│   ├── frames.py            # LD2450 wire-format codec (parse / build_frame)
+│   ├── reader_base.py       # Reader abstraction + make_reader factory + FakeReader (sim)
+│   ├── serial_reader.py     # Serial (UART) reader + AUTO-baud probe
+│   ├── mqtt_client.py       # MQTT frame receiver
+│   ├── trajectories.py      # Synthetic motion generators (for the sim reader)
+│   ├── tracking.py          # Per-target bookkeeping; persists to SQLite
+│   ├── store.py             # SQLite TrackStore (sensors / tracks / track_points)
+│   ├── geometry.py          # Pure projection + arc math (shared)
+│   ├── render.py            # Shared pygame drawing (sensor / target / trail)
+│   ├── gui.py               # Live visualization GUI (PyGame main window)
+│   ├── playback_gui.py      # SQLite-backed playback GUI (shares the renderer)
+│   ├── colors.py            # Color helpers
+│   ├── widgets.py           # Small GUI widgets (color picker)
+│   ├── svg_utils.py         # SVG rasterization + coordinate fitting
+│   ├── sound.py             # Distance/velocity audio tones
+│   └── logging_setup.py     # Rotating run-logs/ logger
+├── tools/                   # csv_to_sqlite.py (import legacy CSV), sim_sensor.py
+├── tests/                   # pytest suite (headless-safe)
+├── radar_config.json        # Generated runtime configuration
+└── pondeyes.db              # SQLite track log (created on first run; git-ignored)
 ```
 
 ---
@@ -105,21 +136,41 @@ Product page: [https://www.amazon.com/dp/B07BBPX8B8](https://www.deshide.com/pro
 
 ## Configuration
 
-Configuration is managed through `radar/config.py` and stored as a JSON file (`radar_config.json`) in the project root.
+Configuration is managed through `radar/config.py` and stored as a JSON file (`radar_config.json`) in the project root. As of v4.0 the schema is **multi-sensor**: a top-level `sensors` array, each entry carrying its own transport, pose, and color. Global display/visual settings stay at the top level.
 
 Example configuration:
 
 ```json
 {
+  "schema_version": 2,
+  "sensors": [
+    {
+      "id": "S1",
+      "label": "Front Bumper",
+      "color": "#00ff80",
+      "input_mode": "serial",
+      "serial_port": "/dev/cu.usbserial-0001",
+      "serial_baud": 256000,
+      "position": [4896.2, 7471.8],
+      "heading": 0.0,
+      "trail_on": true,
+      "min_range_mm": 0.0,
+      "max_range_mm": 3000.0,
+      "speed_sensitivity": 0.25
+    },
+    {
+      "id": "S2",
+      "label": "Rear Bumper",
+      "color": "#ff8800",
+      "input_mode": "mqtt",
+      "broker": "127.0.0.1",
+      "port": 1883,
+      "topic": "PondEyes/raw_S2",
+      "position": [4896.2, 1200.0],
+      "heading": 180.0
+    }
+  ],
   "map": "map.svg",
-  "sensor": [0.0, 0.0],
-  "heading": 0.0,
-  "input_mode": "mqtt",
-  "serial_port": "/dev/ttyUSB0",
-  "serial_baud": 256000,
-  "broker": "127.0.0.1",
-  "port": 1883,
-  "topic": "PondEyes/raw",
   "trail_duration": 5.0,
   "trail_on": true,
   "smoothing_on": true,
@@ -127,7 +178,21 @@ Example configuration:
 }
 ```
 
-The default configuration file is automatically created or updated from within the GUI configuration screen.
+Per-sensor keys: `serial_baud` (editable in the GUI, with an AUTO-baud probe), `trail_on` (this
+sensor's trail, gated by the main TRAIL master button), `min_range_mm` / `max_range_mm` (display
+distance gates; `0` = off / unlimited), `speed_sensitivity` (`0` = off … `1` = strict; splits a
+track on an implausible "teleport" jump). A `sim` input mode is also available
+(`"input_mode": "sim"`, `"sim_pattern": "circle"`) which emits synthetic frames with no hardware.
+
+**Editing sensors:** the in-GUI **CONFIG** screen manages the sensor list (add / remove /
+duplicate, click-to-rename, per-sensor transport + baud + color + speed sensitivity). Pose and
+distance gates are set on the map — via the **Set-Sensor wizard** (click to place, then a combined
+heading + min/max range screen), by **double-clicking a sensor marker** to edit it in place, or by
+**dragging a gate arc** directly on the live map.
+
+**Migration:** an older single-sensor `radar_config.json` (schema v1) is migrated automatically
+on first launch — its `sensor`/`heading`/transport keys fold into `sensors[0]`, and a one-time
+`radar_config.json.bak` is written so you can always revert.
 
 ---
 
@@ -160,37 +225,44 @@ Trails fade based on `trail_duration`. Audible alerts indicate proximity.
 
 ### 5. Logging
 
-Each run generates a log directory under `./logs/YYYY-MM-DD/`.  
-Within this folder:
-- `YYYY-MM-DD_TrackIndex.csv` — metadata of all tracked targets. (first_seen_iso, serial, last_seen_iso, duration, verbose_file)
-- `Txx_HHMMSS.csv` — per-target detailed CSV logs (timestamp, x_mm, y_mm, range_mm, speed_mm_s, accel_mm_s2, raw_hex).
+All tracks are logged to an embedded **SQLite** database (`pondeyes.db`) in the project root —
+one `tracks` row per target with its full **sensor snapshot** (pose, color, distance gates, trail)
+and one `track_points` row per frame (`x_mm`, `y_mm`, `range_mm`, `speed_mm_s`, `accel_mm_s2`,
+`t_rel_s` high-res relative time, `raw_hex`). The timestamp is captured at the reader (frame
+arrival), so the recorded cadence is accurate. (Legacy per-day CSV logs can be imported with
+`tools/csv_to_sqlite.py`.) Verbose runtime logs go to `run-logs/pondeyes.log`.
 
 ---
 
 ## Playback Mode
 
-Tracked target playback is available via the main menu where you can load previously logged CSV's of the target data frames.
+Open **PLAYBACK** from the main menu to browse recent recordings (newest first) and replay one.
+Because each track stores the sensor's recorded snapshot + per-frame timing, playback reconstructs
+the scene exactly as it was captured — using the **same renderer** as the live view.
 
 Playback Features:
-- Load any `Txx_*.csv` log via drag-and-drop or via the native file browser
-- Playback speed from 1× to 20×
-- Toggle trails and smoothing
-- Visual HUD showing elapsed time and sensor orientation
+- Pick a recording from the recent-tracks list
+- Replays each track through its **recorded** sensor pose, color, FOV cone, and distance gates
+- Accurate timeline driven by the recorded per-frame timing; scrub + speed (1×–20×)
+- Toggle trails; a visual HUD with elapsed time
 
 ---
 
 ## Architecture Summary
 
-- `main.py` — Launches and initializes configuration and GUI.  
-- `radar/gui.py` — Core visualization window; manages rendering, sensor setup, and live updates.  
-- `radar/mqtt_client.py` — Handles inbound MQTT data and frame parsing.  
-- `radar/serial_reader.py` — Non-blocking serial input with frame parsing and callback dispatch.  
-- `radar/tracking.py` — Target management and log persistence.  
-- `radar/playback_gui.py` — Replay previously logged tracks.  
-- `radar/svg_utils.py` — Rasterizes SVGs using CairoSVG for accurate map scaling.  
-- `radar/sound.py` — Manages distance and speed-based audible feedback.  
-- `radar/config.py` — JSON configuration management.  
-- `radar/constants.py` — Centralized constants for color, font, and path references.
+- `main.py` — Launches and initializes configuration and GUI.
+- `radar/gui.py` — Core live visualization window; rendering, sensor setup, live updates.
+- `radar/reader_base.py` — Reader abstraction + `make_reader` factory; `FakeReader` (sim). Readers
+  deliver `(frame, t_mono)` so timing is stamped at arrival.
+- `radar/serial_reader.py` / `radar/mqtt_client.py` — Serial (with AUTO-baud) and MQTT inputs.
+- `radar/tracking.py` — Per-target bookkeeping (incl. teleport split); persists to SQLite.
+- `radar/store.py` — SQLite `TrackStore` (versioned schema, per-track sensor snapshot + timing).
+- `radar/geometry.py` / `radar/render.py` — Shared projection math + draw primitives used by BOTH
+  the live view and playback (one renderer, no duplication).
+- `radar/playback_gui.py` — Replays SQLite recordings through the shared renderer.
+- `radar/svg_utils.py` — Rasterizes SVGs using CairoSVG for accurate map scaling.
+- `radar/sound.py` — Distance/speed-based audible feedback.
+- `radar/config.py` / `radar/constants.py` — JSON config (schema v2 + migration) and constants.
 
 ---
 
@@ -199,8 +271,8 @@ Playback Features:
 1. Connect radar module via USB or set up MQTT publisher  
 2. Launch `python3 main.py`  
 3. Use GUI configuration to select mode and confirm connection
-4. Observe targets in real time; CSV logs will be written automatically
-5. Run playback viewer to replay or analyze motion patterns
+4. Observe targets in real time; tracks are logged to `pondeyes.db` automatically
+5. Open PLAYBACK to replay or analyze recorded sessions
 
 ---
 
@@ -208,8 +280,8 @@ Playback Features:
 
 - PondEyes was designed in an effort to research the effectiveness of mm-wave radar modules for tracking human targets in a private space
 - Code modularity allows replacement of radar backends or visualization layers
-- `radar/tracking.py` uses per-day indexing for persistence and log integrity
-- Logging system creates one CSV per tracked target and a per-day index
+- `radar/tracking.py` persists tracks to SQLite (`radar/store.py`) with a versioned schema
+- The live view and playback share one renderer (`radar/geometry.py` + `radar/render.py`)
 - Uses CairoSVG for vector scaling; SVG maps should define physical size (in mm or cm) for accurate projection
 
 ---

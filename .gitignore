@@ -12,8 +12,28 @@ venv/
 
 # PondEyes runtime
 radar_config.json
+radar_config.json.bak
 log/
 logs/
+
+# SQLite track store (generated at runtime) + WAL/SHM sidecars
+pondeyes.db
+pondeyes.db-wal
+pondeyes.db-shm
+
+# Dev-only docs — NEVER published (local narrative, design specs, backlog, bug list)
+CLAUDE.md
+DEVLOG.md
+MULTI_SENSOR_SPRINT_PLAN.md
+HARNESS_SPIKE.md
+BACKLOG.md
+BUGFIXES.md
+
+# Dev-only reference material (screenshots of GUI issues, scratch notes) — NEVER published
+devdocs/
+
+# Runtime logs (verbose app logging) — NEVER published
+run-logs/
 
 # SVG maps — keep the default, ignore generated/local maps
 *.svg

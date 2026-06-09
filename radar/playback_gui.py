@@ -1,252 +1,202 @@
-"""
-radar.playback_gui
-==================
+# radar.playback_gui
+# ==================
+#
+# Standalone playback window launched from the live GUI. Rewritten for the SQLite store.
+#
+# Selection phase: lists the most recent tracks from pondeyes.db (one row per track, showing
+# the source sensor, serial, start time, duration and point count). Click one to replay it.
+#
+# Playback phase: replays the chosen track's points through the sensor SNAPSHOT recorded with the
+# track (pose, colour, distance gates, trail) — so a later config change never alters an old
+# recording — using the SAME renderer as the live view (radar.geometry + radar.render), so it
+# looks identical. The timeline is driven by the recorded high-res per-frame timing (t_rel_s).
+#
+# All pygame, no Tkinter.
 
-Standalone playback window launched from the live Mini-Radar GUI.
-
-Selection phase
----------------
-• Drag-and-drop a “*.csv” onto THIS window
-• Click one of the 10 most-recent recordings (pulled from the latest **events.csv**)
-• Edit / type a path (textbox pre-filled with today’s log folder)
-
-Playback phase
---------------
-• Same SVG map & sensor pose as live view
-• Target dot, fading trail, colour like live (simplified)
-• Play / Pause / Stop, Exit
-• Draggable timeline head, 1×-20× speed slider
-• Toggle buttons: Trail ON/OFF, Smooth ON/OFF
-• Large playback clock (HH:MM:SS since start)
-
-All in PyGame – no Tkinter, no subprocess.  Works macOS / Linux / Windows.
-"""
 from __future__ import annotations
-import csv, os, math, time, datetime as dt, threading, collections
-from pathlib import Path
+
+import datetime as dt
+import math
+import threading
+import time
+import collections
 from typing import List, Tuple
 
 import pygame
 from pygame.locals import *
 
 from radar import constants as C
+from radar import colors
+from radar import geometry
+from radar import render
 from radar.svg_utils import fit_svg
+from radar.store import TrackStore
 
-# ───────────────────────── project paths ──────────────────────────
-LOG_ROOT = Path.cwd() / "logs"
-TODAY_DIR = LOG_ROOT / dt.datetime.now().strftime("%Y-%m-%d")
-
-# fonts for selection ui
 SEL_FONT = C.MID_FONT
 HDR_FONT = C.BIG_FONT
 
 
 class RadarPlaybackGUI:
-    """One self-contained PyGame window covering selection + playback."""
-    # ─────────────────────────────── init ──────────────────────────────
-    def __init__(self, cfg: dict, preset_path: str | Path | None = None):
+    # One self-contained pygame window covering selection + playback.
+    def __init__(self, cfg: dict, preset_track_id: int | None = None):
         pygame.display.set_caption("Mini-Radar – Playback")
         self.screen = pygame.display.set_mode((1100, 750))
-        self.clock  = pygame.time.Clock()
+        self.clock = pygame.time.Clock()
+        self.cfg = cfg
 
-        # ── selection-phase state
-        self.selection_mode = True
-        self.text_active    = False
-        self.text_path      = str(TODAY_DIR) + os.sep
-        if preset_path:
-            self.text_path = str(preset_path)
-        self.recent_csv = self._scan_recent()          # newest → oldest
+        # Open the same SQLite store the live app writes to.
+        self.store = TrackStore(C.ROOT / "pondeyes.db")
+        self.tracks = self.store.list_recent_tracks(50)     # newest first
         self.list_rects: List[pygame.Rect] = []
 
-        # ── playback-phase state
-        self.data: List[Tuple[float, List[str]]] = []  # (t_rel_sec, row[1:])
-        self.idx         = 0
-        self.paused      = True
-        self.speed       = 1.0
+        # selection vs playback
+        self.selection_mode = True
+
+        # playback state
+        self.data: List[Tuple[float, int, int]] = []        # (t_rel_sec, x_mm, y_mm)
+        self.pose: Tuple[float, float, float] = (0.0, 0.0, 0.0)   # recorded sensor pose
+        self.track_color = (0, 255, 0)
+        self.sensor_min_range_mm = 0.0      # recorded distance gates (drawn like the live view)
+        self.sensor_max_range_mm = 0.0
+        self.capture_start = None           # real wall-clock time the track started (from first_seen)
+        self.idx = 0
+        self.paused = True
+        self.speed = 1.0
         self.dragging_tl = False
         self.worker_alive = False
         self.thread: threading.Thread | None = None
-        self.latest_frame: List[str] = []
+        self.trail: collections.deque = collections.deque(maxlen=400)
 
-        # ── map & pose (same as live view)
+        # map (HUD reserves space at the bottom for: clock row, button row, two sliders)
+        HUD = 112
         self.svg_surf, self.ppm = fit_svg(
-            cfg["map"],
-            (self.screen.get_width(),
-             self.screen.get_height() - 90))       # leave HUD space
-        self.off_x = (self.screen.get_width()  - self.svg_surf.get_width())  // 2
-        self.off_y = (self.screen.get_height() - 90 - self.svg_surf.get_height()) // 2
-        self.sensor_mm = cfg["sensor"][:]
-        self.sensor_hd = cfg["heading"]
+            cfg["map"], (self.screen.get_width(), self.screen.get_height() - HUD))
+        self.off_x = (self.screen.get_width() - self.svg_surf.get_width()) // 2
+        self.off_y = (self.screen.get_height() - HUD - self.svg_surf.get_height()) // 2
+        self.proj = geometry.Projector(self.off_x, self.off_y, self.ppm,
+                                       self.svg_surf.get_height())
 
-        # trails / smoothing toggles
-        self.trail_on      = True
-        self.smoothing_on  = True
-        self.trails: dict[str, collections.deque] = {}
-        self.motion_hist: dict[str, collections.deque] = {}
-
-        # ── HUD rects
+        # HUD rects — stacked bottom-up with clear gaps so nothing overlaps:
+        #   buttons row → speed slider → timeline slider; clock sits above, on the right.
         h = self.screen.get_height()
-        self.btn_play   = pygame.Rect(50, h - 72, 80, 30)
-        self.btn_pause  = pygame.Rect(140, h - 72, 80, 30)
-        self.btn_stop   = pygame.Rect(230, h - 72, 80, 30)
-        self.btn_exit   = pygame.Rect(self.screen.get_width() - 120, h - 72, 90, 30)
-        self.slider_tl  = pygame.Rect(50, h - 42, self.screen.get_width() - 100, 8)
-        self.slide_spd  = pygame.Rect(50, h - 57, self.screen.get_width() - 100, 8)
-        self.btn_trail  = pygame.Rect(self.btn_stop.right + 30, h - 72, 90, 30)
-        self.btn_smooth = pygame.Rect(self.btn_trail.right + 20, h - 72, 90, 30)
+        w = self.screen.get_width()
+        self.btn_play = pygame.Rect(50, h - 84, 80, 28)
+        self.btn_pause = pygame.Rect(140, h - 84, 80, 28)
+        self.btn_stop = pygame.Rect(230, h - 84, 80, 28)
+        self.btn_trail = pygame.Rect(330, h - 84, 90, 28)
+        self.btn_back = pygame.Rect(440, h - 84, 90, 28)     # back to selection list
+        self.btn_exit = pygame.Rect(w - 120, h - 84, 90, 28)
+        self.slide_spd = pygame.Rect(50, h - 44, 220, 8)     # speed: short, label to its right
+        self.slider_tl = pygame.Rect(50, h - 22, w - 100, 8)  # timeline: full width at the bottom
+        self.trail_on = True
 
-        # if preset_path passed, auto-load
-        if preset_path:
-            self._begin_playback(Path(preset_path))
+        if preset_track_id is not None:
+            self._begin_playback_id(preset_track_id)
 
-    # ───────────────────────── recent list via events.csv ─────────────
-    def _scan_recent(self) -> List[Path]:
-        """
-        Grab last 10 recording paths from the newest events.csv (written by live GUI).
-        Each row in events.csv ends with the path to the track’s CSV.
-        """
-        ev_files = sorted(LOG_ROOT.glob("*/events.csv"), key=os.path.getmtime,
-                          reverse=True)
-        if not ev_files:
-            return []
-        latest_evt = ev_files[0]
-        recs: List[Path] = []
-        with open(latest_evt) as f:
-            for line in reversed(f.readlines()):
-                cand = line.strip().split(",")[-1]
-                p = Path(cand)
-                if p.suffix.lower() == ".csv" and p.exists():
-                    recs.append(p)
-                if len(recs) == 10:
-                    break
-        return recs
-
-    # ─────────────────────── helper: mm→px, world Xform ───────────────
+    # ── geometry: project a recorded point through its own pose, then to pixels (shared math) ─
     def _mm_to_px(self, mx, my):
-        return (self.off_x + int(mx * self.ppm),
-                self.off_y + int(self.svg_surf.get_height() - my * self.ppm))
+        return self.proj.mm_to_px(mx, my)
 
-    def _local_to_world(self, xl, yl):
-        sx, sy = self.sensor_mm
-        c, s = math.cos(math.radians(self.sensor_hd)), math.sin(math.radians(self.sensor_hd))
-        return sx + xl * c + yl * s, sy - xl * s + yl * c
+    def _local_to_world(self, xl, yl, pose):
+        return geometry.local_to_world(xl, yl, pose)
 
-    # ───────────────────────── load csv + start worker ────────────────
-    def _begin_playback(self, path: Path):
-        try:
-            with open(path, newline="") as f:
-                rdr = csv.reader(f)
-                rows = list(rdr)
-        except Exception as exc:
-            print("Playback load-error:", exc)
-            return
-
+    # ── load a track by id and start the replay worker ───────────────────────────────────
+    def _begin_playback_id(self, track_id: int):
+        rows = self.store.fetch_points(track_id)
         if not rows:
-            print("Empty CSV – abort")
             return
+        # Track header carries the RECORDED sensor snapshot (pose, colour, gates, trail) so
+        # playback reconstructs the scene as-recorded — like the live view.
+        track = next((t for t in self.store.list_recent_tracks(500) if t["id"] == track_id), None)
+        if track is not None:
+            self.pose = (track["sensor_x"], track["sensor_y"], track["sensor_heading"])
+            chex = track["sensor_color"] or self.store.sensor_color(track["sensor_id"])  # fallback for pre-v2
+            self.track_color = colors.hex_to_rgb(chex)
+            self.sensor_min_range_mm = track["sensor_min_range_mm"] or 0.0
+            self.sensor_max_range_mm = track["sensor_max_range_mm"] or 0.0
+            self.trail_on = bool(track["sensor_trail_on"])           # default Trail to as-recorded
+            try:
+                self.capture_start = dt.datetime.fromisoformat(track["first_seen"])  # real capture time
+            except (ValueError, TypeError):
+                self.capture_start = None
 
-        # header detection
-        def _is_float(x: str) -> bool:
-            try: float(x); return True
-            except ValueError: return False
+        # Timeline: prefer the high-res monotonic t_rel_s (accurate cadence); fall back to
+        # wall-clock t_iso deltas for pre-v2 recordings where t_rel_s is NULL.
+        if rows[0]["t_rel_s"] is not None:
+            t0 = rows[0]["t_rel_s"]
+            self.data = [((r["t_rel_s"] or 0.0) - t0, r["x_mm"], r["y_mm"]) for r in rows]
+        else:
+            def _ts(iso):
+                return dt.datetime.fromisoformat(iso).timestamp()
+            t0 = _ts(rows[0]["t_iso"])
+            self.data = [(_ts(r["t_iso"]) - t0, r["x_mm"], r["y_mm"]) for r in rows]
 
-        if not _is_float(rows[0][0]):
-            rows.pop(0)           # drop header
-
-        if not rows:
-            print("CSV had only header – abort")
-            return
-
-        # parse timestamps → relative seconds
-        def _row_time(r):
-            cand = r[0] if _is_float(r[0]) or 'T' in r[0] else r[1]
-            if 'T' in cand:
-                return dt.datetime.fromisoformat(cand).timestamp()
-            val = float(cand)
-            return val / 1000.0 if val > 1e11 else val
-
-        t0 = _row_time(rows[0])
-        self.data = [(_row_time(r) - t0, r[1:]) for r in rows]
-
-        self.selection_mode = False
-        self.paused = False
+        self.trail.clear()
         self.idx = 0
-
+        self.paused = False
+        self.selection_mode = False
         self.worker_alive = True
         self.thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.thread.start()
 
-    # ───────────────────────── background frame loop ──────────────────
     def _worker_loop(self):
+        # Advance the playback head in real time, scaled by the speed control.
         while self.worker_alive and self.idx < len(self.data):
             if self.paused:
-                time.sleep(0.05); continue
-
-            now_t, fr = self.data[self.idx]
-            self.latest_frame = fr
-
+                time.sleep(0.05)
+                continue
             if self.idx:
-                prev_t, _ = self.data[self.idx - 1]
+                prev_t = self.data[self.idx - 1][0]
+                now_t = self.data[self.idx][0]
                 time.sleep(max((now_t - prev_t) / self.speed, 0))
             self.idx += 1
 
-    # ───────────────────────── selection-phase events ─────────────────
+    # ── events ───────────────────────────────────────────────────────────────────────────
     def _sel_events(self, ev):
-        if ev.type == pygame.DROPFILE and ev.file.lower().endswith(".csv"):
-            self._begin_playback(Path(ev.file)); return
-
         if ev.type == MOUSEBUTTONDOWN and ev.button == 1:
-            # list click
-            for p, rect in zip(self.recent_csv, self.list_rects):
+            if getattr(self, "btn_sel_exit", None) and self.btn_sel_exit.collidepoint(ev.pos):
+                self.worker_alive = False
+                pygame.event.post(pygame.event.Event(QUIT))
+                return
+            for track, rect in zip(self.tracks, self.list_rects):
                 if rect.collidepoint(ev.pos):
-                    self._begin_playback(p); return
-            # textbox focus
-            entry_r = pygame.Rect(40, 320, self.screen.get_width() - 80, 34)
-            self.text_active = entry_r.collidepoint(ev.pos)
+                    self._begin_playback_id(track["id"])
+                    return
 
-        if ev.type == KEYDOWN and self.text_active:
-            if ev.key == K_RETURN:
-                self._begin_playback(Path(self.text_path))
-            elif ev.key == K_BACKSPACE:
-                self.text_path = self.text_path[:-1]
-            elif ev.unicode and 32 <= ord(ev.unicode) < 127:
-                self.text_path += ev.unicode
-
-    # ───────────────────────── playback-phase events ─────────────────
     def _play_events(self, ev):
         if ev.type == MOUSEBUTTONDOWN and ev.button == 1:
             if self.btn_exit.collidepoint(ev.pos):
                 self.worker_alive = False
-                pygame.event.post(pygame.event.Event(QUIT)); return
-            if self.btn_play.collidepoint(ev.pos):
+                pygame.event.post(pygame.event.Event(QUIT))
+            elif self.btn_back.collidepoint(ev.pos):
+                self.worker_alive = False
+                self.selection_mode = True
+                self.tracks = self.store.list_recent_tracks(50)
+            elif self.btn_play.collidepoint(ev.pos):
                 self.paused = False
             elif self.btn_pause.collidepoint(ev.pos):
                 self.paused = True
             elif self.btn_stop.collidepoint(ev.pos):
-                self.idx = 0; self.paused = True
+                self.idx = 0
+                self.paused = True
             elif self.btn_trail.collidepoint(ev.pos):
                 self.trail_on = not self.trail_on
-            elif self.btn_smooth.collidepoint(ev.pos):
-                self.smoothing_on = not self.smoothing_on
             elif self.slider_tl.collidepoint(ev.pos):
                 self.dragging_tl = True
-                self._seek(mx=ev.pos[0])
+                self._seek(ev.pos[0])
             elif self.slide_spd.collidepoint(ev.pos):
                 rel = (ev.pos[0] - self.slide_spd.x) / self.slide_spd.w
                 self.speed = round(1 + max(0, min(1, rel)) * 19, 1)
-
         elif ev.type == MOUSEBUTTONUP and ev.button == 1:
             self.dragging_tl = False
-
         elif ev.type == MOUSEMOTION and self.dragging_tl:
-            self._seek(mx=ev.pos[0])
+            self._seek(ev.pos[0])
 
     def _seek(self, mx: int):
-        rel = (mx - self.slider_tl.x) / self.slider_tl.w
-        rel = max(0.0, min(1.0, rel))
+        rel = max(0.0, min(1.0, (mx - self.slider_tl.x) / self.slider_tl.w))
         self.idx = int(rel * max(len(self.data) - 1, 0))
 
-    # ───────────────────────── main loop ─────────────────────────────
+    # ── main loop ────────────────────────────────────────────────────────────────────────
     def run(self):
         running = True
         while running:
@@ -259,118 +209,99 @@ class RadarPlaybackGUI:
                     self._play_events(ev)
 
             self.screen.fill(C.BLACK)
-
             if self.selection_mode:
                 self._draw_selection()
             else:
                 self._draw_playback()
-
             pygame.display.flip()
             self.clock.tick(60)
 
-        # shutdown
         self.worker_alive = False
-        pygame.time.wait(200)
+        pygame.time.wait(150)
+        self.store.close()
 
-    # ───────────────────────── drawing helpers ───────────────────────
+    # ── drawing ──────────────────────────────────────────────────────────────────────────
     def _draw_selection(self):
         w = self.screen.get_width()
         title = HDR_FONT.render("Load Recorded Track", True, C.GREEN)
-        self.screen.blit(title, (w // 2 - title.get_width() // 2, 40))
+        self.screen.blit(title, (w // 2 - title.get_width() // 2, 30))
 
-        y0 = 120
-        hint = C.SMALL_FONT.render("Recent (newest first)", True, C.DIM)
-        self.screen.blit(hint, (80, y0 - 26))
+        # Obvious EXIT button (top-right) so you can leave the selection screen without a track.
+        self.btn_sel_exit = pygame.Rect(w - 130, 30, 100, 36)
+        pygame.draw.rect(self.screen, C.GREEN, self.btn_sel_exit, 2)
+        self.screen.blit(C.FONT.render("EXIT", True, C.GREEN),
+                         C.FONT.render("EXIT", True, C.GREEN).get_rect(center=self.btn_sel_exit.center))
+
+        y0 = 110
+        self.screen.blit(C.SMALL_FONT.render("Recent tracks (newest first) — click to replay   "
+                                             "(or press Esc / EXIT to leave)",
+                                             True, C.DIM), (60, y0 - 28))
         self.list_rects.clear()
-
-        for i, p in enumerate(self.recent_csv):
-            surf = SEL_FONT.render(p.name, True, C.GREEN)
-            rect = surf.get_rect(topleft=(80, y0 + i * 36))
+        if not self.tracks:
+            self.screen.blit(SEL_FONT.render("(no recordings yet)", True, C.DIM), (60, y0))
+            return
+        for i, t in enumerate(self.tracks[:16]):
+            chip = colors.hex_to_rgb(self.store.sensor_color(t["sensor_id"]))
+            pygame.draw.rect(self.screen, chip, pygame.Rect(60, y0 + i * 34 + 2, 14, 14))
+            start = t["first_seen"][:19].replace("T", " ")
+            label = (f"{t['sensor_id']}/{t['serial']}   {start}   "
+                     f"{t['point_count']} pts   {t['duration_sec']:.0f}s")
+            surf = SEL_FONT.render(label, True, C.GREEN)
+            rect = surf.get_rect(topleft=(82, y0 + i * 34))
             self.screen.blit(surf, rect)
-            self.list_rects.append(rect)
-
-        # textbox
-        entry_r = pygame.Rect(40, 320, w - 80, 34)
-        pygame.draw.rect(self.screen, C.DIM, entry_r)
-        pygame.draw.rect(self.screen, C.GREEN, entry_r, 2)
-        txt = SEL_FONT.render(self.text_path + (" ▌" if self.text_active else ""),
-                              True, C.GREEN)
-        self.screen.blit(txt, (entry_r.x + 8, entry_r.y + 5))
-
-        hint2 = C.SMALL_FONT.render("Type path + ↵  •  drag .csv  •  click recent",
-                                    True, C.DIM)
-        self.screen.blit(hint2, (40, entry_r.bottom + 12))
+            self.list_rects.append(pygame.Rect(60, y0 + i * 34, w - 120, 30))
 
     def _draw_playback(self):
-        # map
         self.screen.blit(self.svg_surf, (self.off_x, self.off_y))
+        # Sensor as it was at record time — marker + FOV cone + distance-gate arcs/fill — via the
+        # SAME renderer the live view uses, so playback looks identical.
+        render.draw_sensor(self.screen, self.proj, self.pose, self.track_color,
+                           min_range_mm=self.sensor_min_range_mm,
+                           max_range_mm=self.sensor_max_range_mm, label_font=C.SMALL_FONT)
 
-        # current frame → draw target & trail
-        if self.latest_frame:
-            try:
-                ser  = self.latest_frame[0]
-                x_mm = float(self.latest_frame[1])
-                y_mm = float(self.latest_frame[2])
-                px, py = self._mm_to_px(*self._local_to_world(x_mm, y_mm))
-                now = time.monotonic()
-                tr = self.trails.setdefault(ser, collections.deque(maxlen=200))
-                tr.append((px, py, now))
-                # trail dots
-                if self.trail_on:
-                    for tx, ty, tt in tr:
-                        fade = 1 - (now - tt) / 5.0
-                        if fade <= 0: continue
-                        dot = pygame.Surface((8, 8), pygame.SRCALPHA)
-                        pygame.draw.circle(dot, (0, 255, 0, int(255 * fade)), (4, 4), 4)
-                        self.screen.blit(dot, (tx - 4, ty - 4))
-                # head
-                pygame.draw.circle(self.screen, C.GREEN, (px, py), 6)
-            except Exception:
-                pass
+        if self.data and 0 <= self.idx < len(self.data):
+            _t, x_mm, y_mm = self.data[self.idx]
+            px, py = self._mm_to_px(*self._local_to_world(x_mm, y_mm, self.pose))
+            now = time.monotonic()
+            self.trail.append((px, py, now, self.track_color))
+            if self.trail_on:
+                render.draw_trail(self.screen, self.trail, now, 5.0, skip_pos=(px, py))
+            render.draw_target(self.screen, px, py, self.track_color, pulse=now % 1.0)
 
         self._draw_hud()
 
     def _draw_hud(self):
-        # buttons
-        for rect, lbl in ((self.btn_play,  "Play"),
-                          (self.btn_pause, "Pause"),
-                          (self.btn_stop,  "Stop"),
-                          (self.btn_exit,  "Exit")):
+        for rect, lbl in ((self.btn_play, "Play"), (self.btn_pause, "Pause"),
+                          (self.btn_stop, "Stop"), (self.btn_back, "List"),
+                          (self.btn_exit, "Exit")):
             pygame.draw.rect(self.screen, C.DIM, rect, 2)
-            t = C.FONT.render(lbl, True, C.GREEN)
-            self.screen.blit(t, (rect.x + 8, rect.y + 6))
+            self.screen.blit(C.FONT.render(lbl, True, C.GREEN), (rect.x + 8, rect.y + 6))
+        pygame.draw.rect(self.screen, C.GREEN if self.trail_on else C.DIM, self.btn_trail, 2)
+        self.screen.blit(C.FONT.render("Trail", True, C.GREEN),
+                         (self.btn_trail.x + 8, self.btn_trail.y + 6))
 
-        # trail / smoothing toggles
-        for rect, lbl, on in ((self.btn_trail,  "Trail",  self.trail_on),
-                              (self.btn_smooth, "Smooth", self.smoothing_on)):
-            pygame.draw.rect(self.screen, C.DIM if not on else C.GREEN, rect, 2)
-            t = C.FONT.render(lbl, True, C.GREEN)
-            self.screen.blit(t, (rect.x + 8, rect.y + 6))
-
-        # timeline slider
-        if self.data:
-            pct = self.idx / (len(self.data) - 1)
-        else:
-            pct = 0
+        pct = self.idx / (len(self.data) - 1) if len(self.data) > 1 else 0
         hx = self.slider_tl.x + int(pct * self.slider_tl.w)
         pygame.draw.rect(self.screen, C.DIM, self.slider_tl, 2)
-        pygame.draw.circle(self.screen, C.GREEN,
-                           (hx, self.slider_tl.centery), 6)
+        pygame.draw.circle(self.screen, C.GREEN, (hx, self.slider_tl.centery), 6)
 
-        # speed slider
         rel = (self.speed - 1) / 19
         sx = self.slide_spd.x + int(rel * self.slide_spd.w)
         pygame.draw.rect(self.screen, C.DIM, self.slide_spd, 2)
-        pygame.draw.circle(self.screen, C.GREEN,
-                           (sx, self.slide_spd.centery), 6)
-        spd_txt = C.FONT.render(f"{self.speed:.1f}×", True, C.GREEN)
-        self.screen.blit(spd_txt, (self.slide_spd.right + 10,
-                                   self.slide_spd.centery - 10))
+        pygame.draw.circle(self.screen, C.GREEN, (sx, self.slide_spd.centery), 6)
+        self.screen.blit(C.FONT.render(f"{self.speed:.1f}×", True, C.GREEN),
+                         (self.slide_spd.right + 10, self.slide_spd.centery - 10))
 
-        # playback clock
         if self.data:
-            t_sec = self.data[self.idx][0]
-            clk = C.BIG_FONT.render(
-                str(dt.timedelta(seconds=int(t_sec))), True, C.GREEN)
+            t_sec = self.data[min(self.idx, len(self.data) - 1)][0]
+            elapsed = str(dt.timedelta(seconds=int(t_sec)))
+            # Show the REAL wall-clock time-of-day of the current frame (capture_start + elapsed)
+            # alongside the elapsed-since-acquisition clock, so the user has an absolute reference.
+            if self.capture_start is not None:
+                wall = (self.capture_start + dt.timedelta(seconds=t_sec)).strftime("%Y-%m-%d %H:%M:%S")
+                txt = f"{wall}   (+{elapsed})"
+            else:
+                txt = elapsed
+            clk = C.FONT.render(txt, True, C.GREEN)
             self.screen.blit(clk, (self.screen.get_width() - clk.get_width() - 20,
-                                   self.btn_play.y - 12))
+                                   self.btn_play.y - clk.get_height() - 8))

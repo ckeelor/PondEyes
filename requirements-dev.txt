@@ -1,0 +1,5 @@
+# Development-only dependencies (test tooling). Install with:
+#   .venv/bin/python -m pip install -r requirements-dev.txt
+# Runtime deps stay in requirements.txt; these are not needed to run the app.
+pytest>=7.4
+pytest-cov>=4.1

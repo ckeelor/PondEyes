@@ -1,19 +1,23 @@
-"""
-radar package
-=============
-
-Utility modules for the Mini-Radar project.
-"""
+# radar package
+# =============
+# Utility modules for the PondEyes Mini-Radar project. v4.0 adds multi-sensor support.
 
 __all__ = [
     "constants",
     "config",
+    "frames",         # shared LD2450 wire-format codec
+    "sensors",        # Sensor dataclass
+    "colors",         # per-sensor colour model
+    "trajectories",   # simulated motion generators
+    "reader_base",    # Reader ABC + make_reader + FakeReader
+    "serial_reader",
+    "mqtt_client",
+    "store",          # SQLite TrackStore
+    "tracking",
     "svg_utils",
     "sound",
-    "mqtt_client",
-    "serial_reader",   # ← NEW
-    "tracking",
+    "widgets",        # ColorPicker
     "gui",
 ]
 
-__version__ = "3.18"
+__version__ = "4.0-dev"
