@@ -41,6 +41,14 @@ It is designed around modular components, each in the `radar/` directory, with a
 - Verbose runtime logging (`run-logs/pondeyes.log`; `PONDEYES_LOG=DEBUG` for detail)
 
 ---
+
+![PondEyes multi-sensor live view: two HLK-LD2450 sensors on one shared map — S1 (pink) and S2
+(blue), each with its own pose, field-of-view cone, 0.5 m range rings, and color-coded targets,
+over an imported SVG map.](docs/multisensor-demo.png)
+
+*Two sensors on one map — each with its own pose, color, FOV cone, and distance gates.*
+
+---
 PondEyes Development Demonstration (YouTube):
 [![Watch the video](https://img.youtube.com/vi/FxQKXyqbS6g/maxresdefault.jpg)](https://youtu.be/FxQKXyqbS6g)
 
@@ -222,6 +230,25 @@ The visualized target marker can have a "trail" added via the configuration. Ena
 
 Targets appear on the SVG map in real-time, color-coded by velocity.  
 Trails fade based on `trail_duration`. Audible alerts indicate proximity.
+
+### 4a. Map navigation & controls
+
+The map behaves like a lightweight mapping view — a **pure viewport** transform that never alters
+the geometry, only how much of the map you see:
+
+- **Pan** — click-and-drag the map, or two-finger scroll.
+- **Zoom** — scroll wheel, the `+` / `-` keys, or the **zoom slider** on the right edge; `0` (or the
+  slider's **`1:1`** button) resets to fit. `Ctrl`/`Cmd` + scroll also zooms to the cursor.
+  > Note: macOS trackpad **pinch-magnify** is not exposed to pygame/SDL2, so use scroll, `Ctrl`/`Cmd`
+  > +scroll, the `+`/`-` keys, or the slider. (A future web frontend would get native pinch.)
+- **Per-target right-click menu** — **Silence** mutes one target's proximity beep; **Ghost** marks a
+  false reading (greyed/translucent + silent). Toggle either off the same way.
+- **Per-sensor "NO DATA"** — a sensor that stops streaming flashes a red indicator on its marker even
+  while other sensors keep running (the full-screen banner only fires when *all* sensors go quiet).
+- **Top menu** — `SOUND`, `NIGHT`, `SMOOTH`, `TRAIL`, `CONFIG`, `MAP`, `FULL_SCREEN`, `PLAYBACK`.
+- **Distance gates** — drag a sensor's min/max arc on the map (a metre readout follows the cursor), or
+  set them in the Set-Sensor wizard.
+- **CONFIG dialog** — close it with the top-right **✕** or **CANCEL**.
 
 ### 5. Logging
 
