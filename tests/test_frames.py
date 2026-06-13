@@ -40,6 +40,17 @@ def test_decode_real_captured_frame():
     assert frames.parse(real) == [(1, 132, 196)]
 
 
+# ── the Ai-Thinker RD-03D speaks the SAME wire format, so the codec parses it unchanged ──
+def test_rd03d_uses_same_wire_format():
+    # RD-03D multi-target frames are byte-for-byte LD2450 frames (header AA FF 03 00, footer
+    # 55 CC, 3 slots x 8 bytes, sign-flag x/y). This pins that compatibility: if the decoder
+    # ever drifts from the shared format, the RD-03D reader breaks too. Same bytes as the real
+    # captured LD2450 frame above, asserted explicitly under the RD-03D's name.
+    rd03d = bytes.fromhex("aaff0300" + "8480c48000006801" + "00" * 16 + "55cc")
+    assert frames.is_complete_frame(rd03d)
+    assert frames.parse(rd03d) == [(1, 132, 196)]
+
+
 # ── empty slots are filtered; an all-empty frame yields no targets ──────────────────────
 def test_empty_slots_filtered():
     assert frames.parse(frames.build_frame([])) == []

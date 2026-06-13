@@ -372,8 +372,8 @@ class RadarGUI:
         # Trail ON (5) is a checkbox now, not a text field, so it's not in this edit cycle.
         if self.input_mode == "mqtt":
             transport = [0, 1, 2]
-        elif self.input_mode == "serial":
-            transport = [3, self.SERIALBAUD_FIELD]   # serial PORT + BAUD
+        elif self.input_mode in ("serial", "rd03d"):   # both are UART: PORT + BAUD
+            transport = [3, self.SERIALBAUD_FIELD]
         else:  # sim — no transport text fields
             transport = []
         # Range gates (7, 8) are NOT in the config text-field cycle — they're set on the map
@@ -392,7 +392,7 @@ class RadarGUI:
         # baud for intelligible LD2450 frames, then alert the user with the result. Synchronous
         # by design — the GUI pauses while it scans, then reports detected / not-found.
         sel = self.selected_sensor
-        if sel is None or self.input_mode != "serial":
+        if sel is None or self.input_mode not in ("serial", "rd03d"):
             return
         port = self.cfg_input[3].strip()
         self._close_inputs()                       # release the port so the probe can open it
@@ -834,15 +834,18 @@ class RadarGUI:
                              (x, y)); y += 28
 
             self.screen.blit(C.FONT.render("Input:", True, C.GREEN), (x, y+4))
-            mqtt_r = pygame.Rect(x+80, y, 64, 26)
-            ser_r = pygame.Rect(mqtt_r.right+8, y, 70, 26)
-            sim_r = pygame.Rect(ser_r.right+8, y, 54, 26)
+            mqtt_r = pygame.Rect(x+80, y, 60, 26)
+            ser_r = pygame.Rect(mqtt_r.right+6, y, 64, 26)
+            rd_r = pygame.Rect(ser_r.right+6, y, 72, 26)
+            sim_r = pygame.Rect(rd_r.right+6, y, 50, 26)
             for r, lbl, on in [(mqtt_r, "MQTT", self.input_mode == "mqtt"),
                                (ser_r, "SERIAL", self.input_mode == "serial"),
+                               (rd_r, "RD-03D", self.input_mode == "rd03d"),
                                (sim_r, "SIM", self.input_mode == "sim")]:
                 pygame.draw.rect(self.screen, C.GREEN if on else C.DIM, r, 2)
                 self.screen.blit(C.SMALL_FONT.render(lbl, True, C.GREEN), (r.x+7, r.y+5))
-            self.cfg_buttons.update({"mode_mqtt": mqtt_r, "mode_serial": ser_r, "mode_sim": sim_r})
+            self.cfg_buttons.update({"mode_mqtt": mqtt_r, "mode_serial": ser_r,
+                                     "mode_rd03d": rd_r, "mode_sim": sim_r})
             y += 34
 
             # Transport text fields — clickable to focus, BLINKING caret on the focused one.
@@ -859,7 +862,7 @@ class RadarGUI:
 
             # AUTO-baud button, inline with the Serial Baud field (serial mode only). Probes the
             # port for a baud that yields intelligible LD2450 frames.
-            if self.input_mode == "serial" and self.SERIALBAUD_FIELD in self.field_rects:
+            if self.input_mode in ("serial", "rd03d") and self.SERIALBAUD_FIELD in self.field_rects:
                 br = self.field_rects[self.SERIALBAUD_FIELD]
                 auto_r = pygame.Rect(br.x + 240, br.y - 1, 76, 22)
                 pygame.draw.rect(self.screen, C.GREEN, auto_r, 2)
@@ -1315,6 +1318,8 @@ class RadarGUI:
                             self.input_mode="mqtt"; self._update_visible()
                         elif self.cfg_buttons["mode_serial"].collidepoint(e.pos):
                             self.input_mode="serial"; self._update_visible()
+                        elif "mode_rd03d" in self.cfg_buttons and self.cfg_buttons["mode_rd03d"].collidepoint(e.pos):
+                            self.input_mode="rd03d"; self._update_visible()
                         elif "mode_sim" in self.cfg_buttons and self.cfg_buttons["mode_sim"].collidepoint(e.pos):
                             self.input_mode="sim"; self._update_visible()
                         else:

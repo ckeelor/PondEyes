@@ -32,8 +32,8 @@ _DEFAULT = {
             "label": "Sensor 1",
             "color": "#00ff80",
             "enabled": True,
-            "input_mode": "mqtt",          # "mqtt" | "serial" | "sim"
-            "serial_port": "/dev/ttyUSB0",
+            "input_mode": "rd03d",         # "rd03d" (Ai-Thinker RD-03D) | "serial" (LD2450) | "mqtt" | "sim"
+            "serial_port": "/dev/serial0", # Pi GPIO UART (Zero 2 W); use /dev/ttyUSB0 for a USB-TTL adapter
             "serial_baud": 256000,
             "broker": "127.0.0.1",
             "port": 1883,

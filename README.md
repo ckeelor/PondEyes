@@ -1,6 +1,8 @@
 # PondEyes
 
-**PondEyes** is a Python-based visualization tool for real-time tracking of human position and motion using low-cost millimeter-wave radar modules such as the **Hi-Link HLK-LD2450**. It runs on macOS and Linux, using **PyGame** to render a top-down map view of a physical space (e.g., a room or hallway) and displays moving targets based on radar data. The system supports **Serial (UART)** and **MQTT** input, logs all targets to an embedded **SQLite** database, and includes a full playback GUI that replays each recorded session exactly as it was captured.
+**PondEyes** is a Python-based visualization tool for real-time tracking of human position and motion using low-cost millimeter-wave radar modules such as the **Hi-Link HLK-LD2450** and the **Ai-Thinker RD-03D**. It runs on macOS and Linux, using **PyGame** to render a top-down map view of a physical space (e.g., a room or hallway) and displays moving targets based on radar data. The system supports **Serial (UART)** and **MQTT** input, logs all targets to an embedded **SQLite** database, and includes a full playback GUI that replays each recorded session exactly as it was captured.
+
+> **Sensor note:** the RD-03D's multi-target frame is byte-for-byte identical to the LD2450 (same `AA FF 03 00 … 55 CC` 30-byte format), so the same codec decodes both. The only difference is that the RD-03D must be told to use *multi-target* mode — PondEyes sends that command automatically when a sensor's `input_mode` is `rd03d`. See [Ai-Thinker RD-03D](#ai-thinker-rd-03d-24-ghz-multi-target-radar) below.
 
 ---
 
@@ -30,7 +32,8 @@ It is designed around modular components, each in the `radar/` directory, with a
 - **Editable serial baud** per sensor, with an **AUTO-baud** probe that locks onto the right rate
 - Tracks up to three live targets *per sensor* (hardware-limited)
 - Custom SVG space maps for accurate placement
-- Serial (UART), MQTT, and **simulated** input modes (the `sim` mode needs no hardware)
+- Serial (UART) for the **LD2450** (`serial`) and **Ai-Thinker RD-03D** (`rd03d`, auto-sends the
+  multi-target command), plus MQTT and **simulated** input modes (the `sim` mode needs no hardware)
 - Adjustable motion smoothing and trail duration
 - Distance-based audible alerts; per-sensor hue, with speed shown by the pulse ring
 - Target logging to an embedded **SQLite** database (`pondeyes.db`), with full sensor attribution
@@ -63,9 +66,9 @@ PondEyes/
 │   ├── config.py            # Loads/saves radar_config.json (schema v2) with migration
 │   ├── constants.py         # Global constants, colors, font setup
 │   ├── sensors.py           # Sensor dataclass (pose, color, transport, gates, ...)
-│   ├── frames.py            # LD2450 wire-format codec (parse / build_frame)
+│   ├── frames.py            # LD2450 / RD-03D wire-format codec (parse / build_frame)
 │   ├── reader_base.py       # Reader abstraction + make_reader factory + FakeReader (sim)
-│   ├── serial_reader.py     # Serial (UART) reader + AUTO-baud probe
+│   ├── serial_reader.py     # Serial (UART) reader + AUTO-baud probe; RadarRD03D subclass
 │   ├── mqtt_client.py       # MQTT frame receiver
 │   ├── trajectories.py      # Synthetic motion generators (for the sim reader)
 │   ├── tracking.py          # Per-target bookkeeping; persists to SQLite
@@ -118,6 +121,9 @@ HLK-LD2450 -> FT232 UART to USB Adapter -> MacOS 15 & Ubuntu 24.04 LTS
 MQTT Connection:
 HLK-LD2450 -> FT232 UART to USB Adapter -> Raspberry Pi Zero -> LAN
 
+Direct GPIO-UART Connection (RD-03D):
+Ai-Thinker RD-03D -> Raspberry Pi Zero 2 W GPIO UART (/dev/serial0)
+
 ### Hi-Link HLK-LD2450 24 Ghz MM-Wave Radar Module
 
 | Specification | Value |
@@ -133,6 +139,50 @@ This module provides position (X, Y) and velocity data for up to three simultane
 It can penetrate non-metallic materials and operate under variable lighting conditions.
 
 Product page: [https://www.hlktech.net/index.php?id=1157](https://www.hlktech.net/index.php?id=1157)
+
+### Ai-Thinker RD-03D 24 GHz Multi-Target Radar
+
+| Specification | Value |
+|----------------|-------|
+| Frequency Band | 24 GHz ISM (S5KM312CL FMCW) |
+| Ranging Distance | up to ~8 m |
+| Interface | UART — **256000 baud, 8N1** |
+| Modes | single-target / **multi-target** (PondEyes selects multi on open) |
+| Output Format | 30-byte binary frame, **identical to the LD2450** |
+| Targets | up to three simultaneous (X, Y, speed) |
+
+The RD-03D's multi-target frame uses the same `AA FF 03 00 … 55 CC` layout and sign-flag X/Y
+encoding as the LD2450, so PondEyes decodes it with the same codec ([radar/frames.py](radar/frames.py)).
+The one extra step is selecting multi-target mode: the `rd03d` input mode writes the Ai-Thinker
+command `FD FC FB FA 02 00 90 00 04 03 02 01` once on open (this needs the Pi's **TX → radar RX**
+wired). If TX is not wired, the reader logs a warning and still reads, relying on the radar's
+default mode.
+
+User manual: [RD-03D Multi-Target Trajectory Tracking](https://docs.ai-thinker.com/en/Rd-03D_V2/index.html)
+
+#### Wiring & setup on a Raspberry Pi Zero 2 W (`zero2w4`)
+
+RD-03D logic is 3.3 V, matching the Pi's GPIO — no level shifter needed:
+
+| RD-03D pin | Pi Zero 2 W pin |
+|------------|-----------------|
+| 5V / VCC   | 5V (pin 2 or 4) |
+| GND        | GND (pin 6)     |
+| TX (OT1)   | GPIO15 / RXD (pin 10) |
+| RX         | GPIO14 / TXD (pin 8) |
+
+One-time OS configuration:
+
+1. `sudo raspi-config` → **Interface Options → Serial Port** → login shell over serial: **No**,
+   serial port hardware: **Yes**.
+2. Edit `/boot/firmware/config.txt` (older images: `/boot/config.txt`): ensure `enable_uart=1`
+   and add **`dtoverlay=disable-bt`**. On the Zero 2 W the reliable PL011 UART is wired to
+   Bluetooth by default, leaving `/dev/serial0` as the **mini-UART**, which is unreliable at
+   256000 baud. Disabling BT maps `/dev/serial0` → `/dev/ttyAMA0` (PL011) for stable reads. Reboot.
+3. `sudo usermod -aG dialout $USER`, then log out/in (serial access without `sudo`).
+4. Verify: `ls -l /dev/serial0` should resolve to `ttyAMA0`.
+
+The default `radar_config.json` already ships with one `rd03d` sensor on `/dev/serial0` at 256000.
 
 ### DSD TECH SH-U09C USB to TTL Serial Adapter with FTDI FT232RL Chip
 
@@ -192,6 +242,11 @@ distance gates; `0` = off / unlimited), `speed_sensitivity` (`0` = off … `1` =
 track on an implausible "teleport" jump). A `sim` input mode is also available
 (`"input_mode": "sim"`, `"sim_pattern": "circle"`) which emits synthetic frames with no hardware.
 
+`input_mode` selects the transport: `serial` (LD2450 over UART), `rd03d` (Ai-Thinker RD-03D over
+UART — same serial settings, plus the multi-target command on open), `mqtt`, or `sim`. For an
+RD-03D wired to a Pi's GPIO UART, use `"input_mode": "rd03d"`, `"serial_port": "/dev/serial0"`,
+`"serial_baud": 256000` (this is the shipped default).
+
 **Editing sensors:** the in-GUI **CONFIG** screen manages the sensor list (add / remove /
 duplicate, click-to-rename, per-sensor transport + baud + color + speed sensitivity). Pose and
 distance gates are set on the map — via the **Set-Sensor wizard** (click to place, then a combined
@@ -214,8 +269,10 @@ python3 main.py
 
 ### 2. Select Input Source
 
-- **Serial**: Connect radar via USB/UART.  
+- **Serial (LD2450)**: Connect radar via USB/UART.  
   Set `/dev/ttyUSB0` (Linux) or `/dev/tty.usbserial*` (macOS).
+- **RD-03D**: Ai-Thinker RD-03D over UART (e.g. a Pi's `/dev/serial0`); selects multi-target mode
+  automatically on open.
 - **MQTT**: Enter broker IP, port, and topic (default: `PondEyes/raw`).
 
 ### 3. Set Sensor Position and Angle

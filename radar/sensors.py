@@ -38,7 +38,7 @@ class Sensor:
     trail_on: bool = True            # draw this sensor's target trails (per-sensor; master button on main window)
 
     # ── Transport ───────────────────────────────────────────────────────────────────────
-    input_mode: str = "serial"       # "serial" | "mqtt" | "sim"
+    input_mode: str = "serial"       # "serial" (LD2450) | "rd03d" (Ai-Thinker RD-03D) | "mqtt" | "sim"
     serial_port: str = "/dev/ttyUSB0"
     serial_baud: int = 256000
     broker: str = "127.0.0.1"
@@ -59,7 +59,7 @@ class Sensor:
 
     # ── Tracking ─────────────────────────────────────────────────────────────────────────
     speed_sensitivity: float = 0.25  # 0 = off; 1 = strictest. Higher = split a track sooner
-                                     # when a target "teleports" (the LD2450 reused the slot for
+                                     # when a target "teleports" (the radar reused the slot for
                                      # a different person). Lower for fast runners outdoors.
 
     def __post_init__(self):

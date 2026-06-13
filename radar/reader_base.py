@@ -152,7 +152,10 @@ def make_reader(sensor, on_frame: FrameCallback) -> Reader:
     elif mode == "sim":
         traj = trajectories.make(sensor.sim_pattern)
         reader = FakeReader(on_frame, traj, hz=sensor.sim_hz)
-    else:                                   # default: real serial/UART bridge
+    elif mode == "rd03d":                    # Ai-Thinker RD-03D: serial + multi-target cmd on open
+        from radar.serial_reader import RadarRD03D
+        reader = RadarRD03D(sensor.serial_port, sensor.serial_baud, on_frame)
+    else:                                   # default: real serial/UART bridge (e.g. LD2450)
         from radar.serial_reader import RadarSerial
         reader = RadarSerial(sensor.serial_port, sensor.serial_baud, on_frame)
 
