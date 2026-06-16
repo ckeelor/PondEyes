@@ -26,8 +26,10 @@ try:
 except Exception:
     matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
+from matplotlib.widgets import Slider, CheckButtons
 from matplotlib.animation import FuncAnimation
+
+MM_PER_FT = 304.8   # the radar reports millimetres; we display feet
 
 REMOTE_CMD = (
     "cd ~/PondEyes && . venv/bin/activate && "
@@ -71,9 +73,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="zero2w4", help="ssh host running the radar")
     ap.add_argument("--window", type=float, default=5.0,
-                    help="initial decay window seconds (0..10)")
-    ap.add_argument("--xlim", type=float, default=3000, help="+/- x extent (mm)")
-    ap.add_argument("--ylim", type=float, default=6000, help="max y / range (mm)")
+                    help="initial decay window seconds (0..30)")
+    ap.add_argument("--xlim", type=float, default=20.0, help="+/- x extent (feet)")
+    ap.add_argument("--ylim", type=float, default=30.0, help="max y / range (feet)")
+    ap.add_argument("--invert-x", action="store_true",
+                    help="start with x axis inverted (radar mounted upside down)")
     args = ap.parse_args()
 
     # Self-heal: a previously hard-killed plot can leave a remote radar_monitor still
@@ -102,10 +106,10 @@ def main():
 
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(7, 7))
-    fig.subplots_adjust(bottom=0.18)
+    fig.subplots_adjust(bottom=0.20)
     ax.set_title(f"RD-03D live — {args.host}")
-    ax.set_xlabel("x (mm)   ← left   right →")
-    ax.set_ylabel("y / distance from sensor (mm)")
+    ax.set_xlabel("x (ft)   ← left   right →")
+    ax.set_ylabel("y / distance from sensor (ft)")
     ax.set_xlim(-args.xlim, args.xlim)
     ax.set_ylim(0, args.ylim)
     ax.set_aspect("equal", adjustable="box")
@@ -118,15 +122,23 @@ def main():
     info = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top",
                    fontsize=9, color="white")
 
-    ax_slider = fig.add_axes([0.15, 0.05, 0.7, 0.03])
-    win_slider = Slider(ax_slider, "decay (s)", 0.0, 10.0,
+    ax_slider = fig.add_axes([0.15, 0.06, 0.6, 0.03])
+    win_slider = Slider(ax_slider, "decay (s)", 0.0, 30.0,
                         valinit=args.window, valstep=0.1)
+
+    # Checkbox to flip the x axis live (the radar usually hangs upside down on the
+    # desk, so its left/right are mirrored). Toggling negates plotted x.
+    ax_check = fig.add_axes([0.80, 0.02, 0.17, 0.10])
+    ax_check.set_facecolor("none")
+    invert_check = CheckButtons(ax_check, ["invert X"], [args.invert_x])
 
     heartbeat = {"n": 0}
 
     def update(_frame):
         now = time.monotonic()
         window = max(win_slider.val, 0.05)   # tiny floor avoids div-by-zero at 0
+        invert = invert_check.get_status()[0]
+        xsign = -1.0 if invert else 1.0
         with LOCK:
             pts = list(POINTS)
         xs, ys, rgba = [], [], []
@@ -139,8 +151,8 @@ def main():
             if age < 0.2:
                 live_n += 1
             r, g, b = SLOT_RGB.get(slot, (1.0, 1.0, 1.0))
-            xs.append(x)
-            ys.append(y)
+            xs.append(xsign * x / MM_PER_FT)   # mm -> ft (+ optional left/right flip)
+            ys.append(y / MM_PER_FT)
             rgba.append((r, g, b, alpha))
         if xs:
             scat.set_offsets(np.column_stack([xs, ys]))
@@ -148,7 +160,8 @@ def main():
         else:
             scat.set_offsets(np.empty((0, 2)))
             scat.set_facecolors(np.empty((0, 4)))
-        info.set_text(f"window={window:4.1f}s   points={len(xs)}   live={live_n}")
+        flip = "  [X inverted]" if invert else ""
+        info.set_text(f"window={window:4.1f}s   points={len(xs)}   live={live_n}{flip}")
         heartbeat["n"] += 1
         if heartbeat["n"] % 40 == 0:   # ~ every 2 s, so we can confirm it's alive
             print(f"[plot] frames_drawn={heartbeat['n']} stream_lines={STATS['lines']} "
