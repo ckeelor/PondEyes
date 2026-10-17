@@ -48,6 +48,16 @@ HDR = bytes.fromhex("AAFF0300")   # 4-byte start-of-frame marker
 FTR = bytes.fromhex("55CC")       # 2-byte end-of-frame marker
 FLEN = 30                         # a complete frame is always exactly 30 bytes
 
+# ── RD-03D mode-select commands ─────────────────────────────────────────────────────────
+# The Ai-Thinker RD-03D emits the exact same 30-byte data frame as the LD2450, but unlike
+# the LD2450 it must be TOLD which reporting mode to use (single- vs multi-target). These
+# are the standard Ai-Thinker command frames: header FD FC FB FA, length 02 00, command
+# word (little-endian), footer 04 03 02 01. They live here — with the rest of the wire
+# format — so the serial reader and the standalone tools (radar_monitor.py) share ONE copy
+# of the bytes, per this module's charter.
+RD03D_MULTI_CMD = bytes.fromhex("fdfcfbfa0200900004030201")   # 0x0090 = multi-target
+RD03D_SINGLE_CMD = bytes.fromhex("fdfcfbfa0200800004030201")  # 0x0080 = single (reference)
+
 
 def s15(word: int) -> int:
     # Decode one LD2450 signed-15-bit `word` (0..65535) into a Python int.
@@ -81,26 +91,32 @@ def is_complete_frame(buf: bytes) -> bool:
     )
 
 
-def parse(buf: bytes) -> List[Tuple[int, int, int]]:
-    # Parse one LD2450 frame into a list of active targets.
-    #
-    # Returns a list of (slot, x_mm, y_mm) tuples, where `slot` is 1-based (1, 2, or 3) to
-    # match the convention the rest of the app already uses. Empty slots — where both x and
-    # y decode to 0 — are filtered out, so a frame with one person yields a 1-element list.
-    #
-    # We intentionally decode only x and y here (not the frame's speed field): the app
-    # derives velocity/acceleration from successive positions in radar/tracking.py, and
-    # keeping parse's output shape identical to the historical readers means Phase 0 changes
-    # nothing observable. The caller is responsible for header/footer validation (see
-    # is_complete_frame); this function trusts that `buf` is at least FLEN bytes.
-    targets: List[Tuple[int, int, int]] = []
+def parse_full(buf: bytes) -> List[Tuple[int, int, int, int]]:
+    # Parse one LD2450/RD-03D frame into (slot, x_mm, y_mm, speed_mm_s) tuples — the ONE
+    # place that knows the per-slot offsets. `slot` is 1-based (1, 2, or 3); empty slots
+    # (x and y both decode to 0) are filtered out. The caller is responsible for
+    # header/footer validation (see is_complete_frame); this trusts `buf` >= FLEN bytes.
+    targets: List[Tuple[int, int, int, int]] = []
     for i in range(3):                       # up to three targets per frame
         off = 4 + i * 8                      # skip the 4-byte header, 8 bytes per target
         x = s15(int.from_bytes(buf[off : off + 2], "little"))
         y = s15(int.from_bytes(buf[off + 2 : off + 4], "little"))
         if x or y:                           # (0, 0) means "this slot is empty" -> skip
-            targets.append((i + 1, x, y))
+            speed = s15(int.from_bytes(buf[off + 4 : off + 6], "little"))
+            targets.append((i + 1, x, y, speed))
     return targets
+
+
+def parse(buf: bytes) -> List[Tuple[int, int, int]]:
+    # Parse one LD2450 frame into a list of active targets: (slot, x_mm, y_mm) tuples, the
+    # convention the rest of the app already uses.
+    #
+    # We intentionally expose only x and y here (not the frame's speed field): the app
+    # derives velocity/acceleration from successive positions in radar/tracking.py, and
+    # keeping parse's output shape identical to the historical readers means Phase 0 changes
+    # nothing observable. Tools that want the radar's own speed reading (radar_monitor.py)
+    # use parse_full() — this is just that decoder with the speed dropped.
+    return [(slot, x, y) for slot, x, y, _speed in parse_full(buf)]
 
 
 def build_frame(

@@ -51,6 +51,14 @@ def test_rd03d_uses_same_wire_format():
     assert frames.parse(rd03d) == [(1, 132, 196)]
 
 
+# ── parse_full keeps the radar's own speed word; parse derives from the same decoder ────
+def test_parse_full_keeps_speed():
+    frame = frames.build_frame([(132, 196, 250), (-500, 1200, -80)])
+    assert frames.parse_full(frame) == [(1, 132, 196, 250), (2, -500, 1200, -80)]
+    # parse() stays the historical (slot, x, y) shape (same decoder, speed dropped)
+    assert frames.parse(frame) == [(1, 132, 196), (2, -500, 1200)]
+
+
 # ── empty slots are filtered; an all-empty frame yields no targets ──────────────────────
 def test_empty_slots_filtered():
     assert frames.parse(frames.build_frame([])) == []

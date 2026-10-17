@@ -32,12 +32,11 @@ LD2450_BAUDS = (921600, 256000, 460800, 230400, 115200, 57600, 38400, 19200, 960
 # ── RD-03D mode-select commands ─────────────────────────────────────────────────────────
 # The RD-03D has two reporting modes (single- vs multi-target). Unlike the LD2450 it must be
 # TOLD which one to use; otherwise it may sit in single-target mode and only ever report one
-# person. These are the standard Ai-Thinker command frames: header FD FC FB FA, length 02 00,
-# command word (little-endian), footer 04 03 02 01. Sending the multi-target word on open is
-# what guarantees up-to-3-target frames. Confirmed against the RD-03D user manual + the
-# ESPHome `rd03d` component. Requires the Pi's TX wired to the radar's RX.
-RD03D_MULTI_CMD = bytes.fromhex("fdfcfbfa0200900004030201")   # 0x0090 = multi-target
-RD03D_SINGLE_CMD = bytes.fromhex("fdfcfbfa0200800004030201")  # 0x0080 = single (reference)
+# person. Sending the multi-target word on open is what guarantees up-to-3-target frames.
+# Confirmed against the RD-03D user manual + the ESPHome `rd03d` component. Requires the
+# Pi's TX wired to the radar's RX. The bytes themselves live in radar.frames (the single
+# home for wire-format knowledge); re-exported here for callers/tests.
+from radar.frames import RD03D_MULTI_CMD, RD03D_SINGLE_CMD  # noqa: F401  (re-export)
 
 
 def probe_baud(port: str, bauds=LD2450_BAUDS, read_s: float = 0.5, need: int = 2):
@@ -95,51 +94,75 @@ class RadarSerial(Reader):
         if self._thread.is_alive():
             self._thread.join(timeout=1)
 
+    # RD-03D on a Pi's PL011 UART: the RX side can silently wedge (cts_event quirk) while the
+    # radar keeps transmitting. The radar streams frames continuously — empty ones included —
+    # so a long silence means the LINK died, not that the room is empty. Only init_cmds
+    # readers (RD-03D) auto-reopen on a stall; the plain LD2450 path keeps its historical
+    # exit-quietly behavior. Reopening also re-sends the mode command, which covers a radar
+    # power-blip reverting it to its default reporting mode.
+    STALL_S = 3.0
+
     def _loop(self) -> None:
-        # Background thread: pull bytes, find the header, and once a full 30-byte frame is
+        # Background thread. The outer loop exists only for the RD-03D stall recovery: one
+        # _session() per port open; reopen while sessions end in a stall (and we're not
+        # stopping). A SerialException still exits quietly — the GUI surfaces "no data" via
+        # its watchdog and the user can re-open the input from CONFIG.
+        try:
+            while self._session() and not self._stop.is_set():
+                log.warning("no data for %.0fs on %s — reopening (PL011 RX stall?)",
+                            self.STALL_S, self.port)
+        except serial.SerialException:
+            # Port vanished or never opened. Exit quietly (see above).
+            pass
+
+    def _session(self) -> bool:
+        # One open→read cycle: pull bytes, find the header, and once a full 30-byte frame is
         # buffered, validate its footer and hand it off. The buffer carries leftover bytes
         # between reads so a frame split across two reads is reassembled correctly.
+        # Returns True to request a reopen (RX stall, init_cmds readers only), False on stop.
         buf = bytearray()
-        try:
-            with serial.Serial(self.port, self.baud, timeout=0.05) as ser:
-                if self.init_cmds:
-                    # Give the radar a moment to boot, then select its reporting mode. If TX
-                    # isn't wired (RX-only rig) the write fails harmlessly — log it and keep
-                    # reading, since the radar usually defaults to multi-target anyway.
-                    try:
-                        time.sleep(0.1)
-                        ser.write(self.init_cmds)
-                        ser.flush()
-                    except (serial.SerialException, OSError) as exc:
-                        log.warning("init command write failed on %s (RX-only? continuing): %s",
-                                    self.port, exc)
-                while not self._stop.is_set():
-                    buf += ser.read(ser.in_waiting or 1)
+        with serial.Serial(self.port, self.baud, timeout=0.05) as ser:
+            if self.init_cmds:
+                # Give the radar a moment to boot, then select its reporting mode. If TX
+                # isn't wired (RX-only rig) the write fails harmlessly — log it and keep
+                # reading, since the radar usually defaults to multi-target anyway.
+                try:
+                    time.sleep(0.1)
+                    ser.write(self.init_cmds)
+                    ser.flush()
+                except (serial.SerialException, OSError) as exc:
+                    log.warning("init command write failed on %s (RX-only? continuing): %s",
+                                self.port, exc)
+            last_rx = time.monotonic()
+            while not self._stop.is_set():
+                chunk = ser.read(ser.in_waiting or 1)
+                if chunk:
+                    buf += chunk
+                    last_rx = time.monotonic()
+                elif self.init_cmds and time.monotonic() - last_rx > self.STALL_S:
+                    return True                    # link stalled -> caller reopens
 
-                    idx = buf.find(self.HDR)
-                    if idx == -1:
-                        # No header in view yet — keep only the last few bytes in case a
-                        # header straddles the boundary, and wait for more data.
-                        if len(buf) > 3:
-                            del buf[:-3]
-                        continue
+                idx = buf.find(self.HDR)
+                if idx == -1:
+                    # No header in view yet — keep only the last few bytes in case a
+                    # header straddles the boundary, and wait for more data.
+                    if len(buf) > 3:
+                        del buf[:-3]
+                    continue
 
-                    if len(buf) < idx + self.FLEN:
-                        continue                       # header found but frame incomplete
+                if len(buf) < idx + self.FLEN:
+                    continue                       # header found but frame incomplete
 
-                    frame = bytes(buf[idx : idx + self.FLEN])
-                    if frame.endswith(self.FTR):
-                        hex_str = frame.hex()
-                        # Same delivery shape as every reader: (slot, x, y, raw_hex).
-                        tracks = [t + (hex_str,) for t in frames.parse(frame)]
-                        self._on_frame(tracks, time.monotonic())   # stamp at frame arrival
-                        del buf[: idx + self.FLEN]     # consume the frame we just handled
-                    else:
-                        del buf[idx]                   # bad footer -> drop one byte and resync
-        except serial.SerialException:
-            # Port vanished or never opened. Exit quietly; the GUI surfaces "no data" via its
-            # watchdog and the user can re-open the input from CONFIG.
-            pass
+                frame = bytes(buf[idx : idx + self.FLEN])
+                if frame.endswith(self.FTR):
+                    hex_str = frame.hex()
+                    # Same delivery shape as every reader: (slot, x, y, raw_hex).
+                    tracks = [t + (hex_str,) for t in frames.parse(frame)]
+                    self._on_frame(tracks, time.monotonic())   # stamp at frame arrival
+                    del buf[: idx + self.FLEN]     # consume the frame we just handled
+                else:
+                    del buf[idx]                   # bad footer -> drop one byte and resync
+            return False
 
 
 class RadarRD03D(RadarSerial):

@@ -12,10 +12,10 @@ import math
 import json
 import argparse
 import serial
-from radar import frames   # reuse the project wire-format (HDR/FTR/FLEN/s15)
+from radar import frames   # reuse the project wire-format (HDR/FTR/FLEN/parse_full)
 
 PORT, BAUD = "/dev/serial0", 256000
-CMD = bytes.fromhex("fdfcfbfa0200900004030201")  # enter multi-target mode
+CMD = frames.RD03D_MULTI_CMD   # enter multi-target mode (single home: radar.frames)
 
 CLEAR = "\x1b[H\x1b[2J"
 SHOW_CURSOR = "\x1b[?25h"
@@ -25,16 +25,10 @@ HEADER = "  slot     x(mm)    y(mm)    speed    range   bearing"
 def decode(frame):
     """Return list of dicts with x, y, speed (mm/s), range (mm), bearing (deg)."""
     out = []
-    for i in range(3):
-        off = 4 + i * 8
-        x = frames.s15(int.from_bytes(frame[off:off + 2], "little"))
-        y = frames.s15(int.from_bytes(frame[off + 2:off + 4], "little"))
-        if not (x or y):
-            continue
-        spd = frames.s15(int.from_bytes(frame[off + 4:off + 6], "little"))
+    for slot, x, y, spd in frames.parse_full(frame):
         rng = math.hypot(x, y)
         brg = math.degrees(math.atan2(x, y))   # 0deg = straight ahead, + = right
-        out.append({"slot": i + 1, "x": x, "y": y, "spd": spd, "rng": rng, "brg": brg})
+        out.append({"slot": slot, "x": x, "y": y, "spd": spd, "rng": rng, "brg": brg})
     return out
 
 
@@ -83,11 +77,17 @@ def main():
                     ser.close()
                 except Exception:
                     pass
-                try:
-                    ser = open_serial()
-                except serial.SerialException as exc:
-                    print(f"[monitor] reopen failed: {exc}", file=sys.stderr, flush=True)
-                    time.sleep(0.5)
+                # Retry until the port opens again — reading from the old, closed handle
+                # would raise. Ctrl-C (KeyboardInterrupt) and --seconds still exit.
+                while True:
+                    if args.seconds and time.monotonic() - t0 >= args.seconds:
+                        return
+                    try:
+                        ser = open_serial()
+                        break
+                    except (serial.SerialException, OSError) as exc:
+                        print(f"[monitor] reopen failed: {exc}", file=sys.stderr, flush=True)
+                        time.sleep(0.5)
                 buf.clear()
                 last_rx = time.monotonic()
                 continue
@@ -95,19 +95,27 @@ def main():
             targets = None
             while True:
                 j = buf.find(frames.HDR)
-                if j < 0 or j + frames.FLEN > len(buf):
+                if j < 0:
+                    # No header in view: trim to the last few bytes (a header may straddle
+                    # reads) so garbage input can't grow the buffer without bound.
+                    if len(buf) > 3:
+                        del buf[:-3]
                     break
-                fr = bytes(buf[j:j + frames.FLEN])
+                if j:
+                    del buf[:j]        # drop garbage before the header; don't rescan it
+                if frames.FLEN > len(buf):
+                    break              # header found but frame incomplete — wait for more
+                fr = bytes(buf[:frames.FLEN])
                 if fr.endswith(frames.FTR):
                     targets = decode(fr)
                     nframes += 1
-                    del buf[:j + frames.FLEN]
+                    del buf[:frames.FLEN]
                     if ndjson:
                         sys.stdout.write(
                             json.dumps({"f": nframes, "targets": targets}) + "\n")
                         sys.stdout.flush()
                 else:
-                    del buf[:j + 1]
+                    del buf[:1]
 
             if ndjson or targets is None:
                 continue

@@ -3,7 +3,7 @@
 
 Runs `ssh <host> ... radar_monitor.py --ndjson` as a subprocess, reads one JSON
 object per frame, and plots targets as a top-down scatter. Each point fades to
-transparent over a decay window set by a slider (0..10 s); points older than the
+transparent over a decay window set by a slider (0..30 s); points older than the
 window are dropped.
 
   python3 radar_plot.py                 # defaults: host=zero2w4, 5 s window
