@@ -1,12 +1,9 @@
 #!/bin/bash
-# Open the PondEyes screen running on a Pi, from the Mac.
+# Open the PondEyes screen running on a Pi, in the Mac's default browser.
 # Usage: deploy/view_from_mac.sh [host]     (default host: pi-radar-z2)
 #
-# Forwards Mac port 5901 -> the Pi's VNC on 5900. Not 5900 on the Mac side: macOS's own
-# Screen Sharing already listens there when it's turned on.
+# The Pi serves a browser viewer (noVNC) that Tailscale Serve publishes tailnet-only at
+# https://<host>.<tailnet>.ts.net/ -- any device on the tailnet (iPhone too) can open it.
 HOST="${1:-pi-radar-z2}"
-LOCAL_PORT="${LOCAL_PORT:-5901}"
-if ! nc -z localhost "$LOCAL_PORT" 2>/dev/null; then
-    ssh -fN -o ExitOnForwardFailure=yes -L "$LOCAL_PORT:localhost:5900" "chris@$HOST" || exit 1
-fi
-open "vnc://localhost:$LOCAL_PORT"
+TAILNET="${TAILNET:-tail5dfe80.ts.net}"
+open "https://$HOST.$TAILNET/"

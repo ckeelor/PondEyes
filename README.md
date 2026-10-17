@@ -187,20 +187,23 @@ One-time OS configuration:
 
 The default `radar_config.json` already ships with one `rd03d` sensor on `/dev/serial0` at 256000.
 
-#### Running headless on the Pi (start at boot, view from a Mac)
+#### Running headless on the Pi (start at boot, view in a browser)
 
 A Zero 2 W in the field has no monitor, so [deploy/](deploy/) runs PondEyes on a virtual screen
-and shares it over VNC (bound to the Pi's localhost only; reached through an SSH tunnel).
+and shows that screen in a web browser (noVNC). The viewer listens on the Pi's localhost only;
+Tailscale Serve publishes it to your tailnet over HTTPS, so only your own devices can open it.
 
-1. On the Pi, once: `sudo apt install libcairo2 xvfb x11vnc x11-utils`, create the venv
-   (`python3 -m venv venv && venv/bin/pip install -r requirements.txt`), then install the service:
+1. On the Pi, once:
    ```bash
+   sudo apt install libcairo2 xvfb x11vnc x11-utils novnc websockify
+   python3 -m venv venv && venv/bin/pip install -r requirements.txt
    sudo cp deploy/pondeyes.service /etc/systemd/system/
    sudo systemctl daemon-reload && sudo systemctl enable --now pondeyes
+   sudo tailscale serve --bg --https 443 http://127.0.0.1:6080
    ```
    PondEyes now starts at boot and restarts if it crashes. Logs: `journalctl -u pondeyes`.
-2. On the Mac: `deploy/view_from_mac.sh` (optional host argument, default `pi-radar-z2`) opens
-   Screen Sharing on the Pi's display, via local port 5901.
+2. Open `https://<pi-host>.<tailnet>.ts.net/` from any device on the tailnet (Mac, iPhone).
+   On the Mac, `deploy/view_from_mac.sh [host]` opens it for you.
 
 ### DSD TECH SH-U09C USB to TTL Serial Adapter with FTDI FT232RL Chip
 
