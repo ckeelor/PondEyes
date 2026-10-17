@@ -1,0 +1,17 @@
+# systemd unit: start PondEyes at boot on a Pi, and restart it if it crashes.
+# Install:  sudo cp deploy/pondeyes.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now pondeyes
+[Unit]
+Description=PondEyes radar tracker (virtual screen + VNC on localhost:5900)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=chris
+WorkingDirectory=/home/chris/PondEyes
+ExecStart=/home/chris/PondEyes/deploy/start_pondeyes_vnc.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

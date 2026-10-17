@@ -160,16 +160,19 @@ default mode.
 
 User manual: [RD-03D Multi-Target Trajectory Tracking](https://docs.ai-thinker.com/en/Rd-03D_V2/index.html)
 
-#### Wiring & setup on a Raspberry Pi Zero 2 W (`zero2w4`)
+#### Wiring & setup on a Raspberry Pi Zero 2 W (`pi-radar-z2`)
 
 RD-03D logic is 3.3 V, matching the Pi's GPIO — no level shifter needed:
 
-| RD-03D pin | Pi Zero 2 W pin |
-|------------|-----------------|
-| 5V / VCC   | 5V (pin 2 or 4) |
-| GND        | GND (pin 6)     |
-| TX (OT1)   | GPIO15 / RXD (pin 10) |
-| RX         | GPIO14 / TXD (pin 8) |
+| RD-03D pin | Wire color | Pi Zero 2 W pin |
+|------------|------------|-----------------|
+| 5V / VCC   | Green      | 5V (pin 2 or 4) |
+| GND        | Yellow     | GND (pin 6)     |
+| TX (OT1)   | Black      | GPIO15 / RXD (pin 10) |
+| RX         | Red        | GPIO14 / TXD (pin 8) |
+
+> **Note:** these colors don't follow the usual convention. Here **black is data (TX), not ground**,
+> and **red is data (RX), not power**. Check the table before rewiring.
 
 One-time OS configuration:
 
@@ -183,6 +186,21 @@ One-time OS configuration:
 4. Verify: `ls -l /dev/serial0` should resolve to `ttyAMA0`.
 
 The default `radar_config.json` already ships with one `rd03d` sensor on `/dev/serial0` at 256000.
+
+#### Running headless on the Pi (start at boot, view from a Mac)
+
+A Zero 2 W in the field has no monitor, so [deploy/](deploy/) runs PondEyes on a virtual screen
+and shares it over VNC (bound to the Pi's localhost only; reached through an SSH tunnel).
+
+1. On the Pi, once: `sudo apt install libcairo2 xvfb x11vnc x11-utils`, create the venv
+   (`python3 -m venv venv && venv/bin/pip install -r requirements.txt`), then install the service:
+   ```bash
+   sudo cp deploy/pondeyes.service /etc/systemd/system/
+   sudo systemctl daemon-reload && sudo systemctl enable --now pondeyes
+   ```
+   PondEyes now starts at boot and restarts if it crashes. Logs: `journalctl -u pondeyes`.
+2. On the Mac: `deploy/view_from_mac.sh` (optional host argument, default `pi-radar-z2`) opens
+   Screen Sharing on the Pi's display, via local port 5901.
 
 ### DSD TECH SH-U09C USB to TTL Serial Adapter with FTDI FT232RL Chip
 
